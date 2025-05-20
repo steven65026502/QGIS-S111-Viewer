@@ -32,5 +32,5 @@ def classFactory(iface):  # pylint: disable=invalid-name
     :type iface: QgsInterface
     """
     #
-    from .s111-viewer import S111Viewer
+    from .s111_viewer import S111Viewer
     return S111Viewer(iface)
