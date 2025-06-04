@@ -1,0 +1,122 @@
+[2025-05-20 09:53:06] 初始化插件時出錯: 'S111ViewerDialog' object has no attribute 'spinArrowSize'
+Traceback (most recent call last):
+  File "C:\Users/Rong/AppData/Roaming/QGIS/QGIS3\profiles\default/python/plugins\s111_viewer\s111_viewer.py", line 1084, in run
+    self.dlg.spinArrowSize.valueChanged.connect(self.update_arrow_size)
+    ^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'S111ViewerDialog' object has no attribute 'spinArrowSize'. Did you mean: 'spinArrowSize_2'?
+
+--------------------------------------------------
+[2025-05-20 09:54:05] 初始化插件時出錯: 'S111ViewerDialog' object has no attribute 'spinArrowSize'
+Traceback (most recent call last):
+  File "C:\Users/Rong/AppData/Roaming/QGIS/QGIS3\profiles\default/python/plugins\s111_viewer\s111_viewer.py", line 1084, in run
+    self.dlg.spinArrowSize.valueChanged.connect(self.update_arrow_size)
+    ^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'S111ViewerDialog' object has no attribute 'spinArrowSize'. Did you mean: 'spinArrowSize_2'?
+
+--------------------------------------------------
+[2025-05-20 11:54:45] 載入 S-111 文件時發生錯誤: cannot access local variable 'height' where it is not associated with a value
+Traceback (most recent call last):
+  File "C:\Users/Rong/AppData/Roaming/QGIS/QGIS3\profiles\default/python/plugins\s111_viewer\s111_viewer.py", line 858, in load_s111_file
+    self.create_vector_layer(0)
+  File "C:\Users/Rong/AppData/Roaming/QGIS/QGIS3\profiles\default/python/plugins\s111_viewer\s111_viewer.py", line 918, in create_vector_layer
+    for y in range(0, min(5, height), 2):
+                             ^^^^^^
+UnboundLocalError: cannot access local variable 'height' where it is not associated with a value
+
+--------------------------------------------------
+[2025-06-05 00:49:20] 載入 S-111 文件時發生錯誤: 'S111Viewer' object has no attribute 'file_manager'
+Traceback (most recent call last):
+  File "C:\Users/Rong/AppData/Roaming/QGIS/QGIS3\profiles\default/python/plugins\s111_viewer\s111_viewer.py", line 1565, in load_s111_file
+    self.update_time_display(0)
+  File "C:\Users/Rong/AppData/Roaming/QGIS/QGIS3\profiles\default/python/plugins\s111_viewer\s111_viewer.py", line 1443, in update_time_display
+    reader = self.file_manager.get_current_reader()
+             ^^^^^^^^^^^^^^^^^
+AttributeError: 'S111Viewer' object has no attribute 'file_manager'
+
+--------------------------------------------------
+[2025-06-05 00:52:14] 載入 S-111 文件時發生錯誤: 'S111Viewer' object has no attribute 'file_manager'
+Traceback (most recent call last):
+  File "C:\Users/Rong/AppData/Roaming/QGIS/QGIS3\profiles\default/python/plugins\s111_viewer\s111_viewer.py", line 1565, in load_s111_file
+  File "C:\Users/Rong/AppData/Roaming/QGIS/QGIS3\profiles\default/python/plugins\s111_viewer\s111_viewer.py", line 1443, in update_time_display
+    if not self.s111_reader:
+             ^^^^^^^^^^^^^^^^
+AttributeError: 'S111Viewer' object has no attribute 'file_manager'
+
+--------------------------------------------------
+[2025-06-05 05:48:01] 載入當前檔案時發生錯誤: 'S111Viewer' object has no attribute 'current_file_path'
+Traceback (most recent call last):
+  File "C:\Users/Rong/AppData/Roaming/QGIS/QGIS3\profiles\default/python/plugins\s111_viewer\s111_viewer.py", line 1158, in load_current_file
+    self.create_vector_layer(0)
+  File "C:\Users/Rong/AppData/Roaming/QGIS/QGIS3\profiles\default/python/plugins\s111_viewer\s111_viewer.py", line 1269, in create_vector_layer
+    file_code = os.path.splitext(os.path.basename(self.current_file_path))[0]
+                                                  ^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'S111Viewer' object has no attribute 'current_file_path'. Did you mean: 'current_file'?
+
+--------------------------------------------------
+[2025-06-05 05:58:30] 載入當前檔案時發生錯誤: 'S111Viewer' object has no attribute 'current_file_path'
+Traceback (most recent call last):
+  File "C:\Users/Rong/AppData/Roaming/QGIS/QGIS3\profiles\default/python/plugins\s111_viewer\s111_viewer.py", line 1150, in load_current_file
+    self.create_vector_layer(0)
+  File "C:\Users/Rong/AppData/Roaming/QGIS/QGIS3\profiles\default/python/plugins\s111_viewer\s111_viewer.py", line 1221, in create_vector_layer
+    file_code = os.path.splitext(os.path.basename(self.current_file_path))[0]
+                                                  ^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'S111Viewer' object has no attribute 'current_file_path'. Did you mean: 'current_file'?
+
+--------------------------------------------------
+[2025-06-05 06:07:37] 創建向量圖層時發生錯誤: 'S111Reader' object has no attribute 'get_time_data'
+Traceback (most recent call last):
+  File "C:\Users/Rong/AppData/Roaming/QGIS/QGIS3\profiles\default/python/plugins\s111_viewer\s111_viewer.py", line 1262, in create_vector_layer
+    current_data = current_reader.get_time_data(time_index)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'S111Reader' object has no attribute 'get_time_data'
+
+--------------------------------------------------
+[2025-06-05 06:07:59] 創建向量圖層時發生錯誤: 'S111Reader' object has no attribute 'get_time_data'
+Traceback (most recent call last):
+  File "C:\Users/Rong/AppData/Roaming/QGIS/QGIS3\profiles\default/python/plugins\s111_viewer\s111_viewer.py", line 1262, in create_vector_layer
+    current_data = current_reader.get_time_data(time_index)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'S111Reader' object has no attribute 'get_time_data'
+
+--------------------------------------------------
+[2025-06-05 06:08:58] 創建向量圖層時發生錯誤: 'S111Reader' object has no attribute 'time_groups'
+Traceback (most recent call last):
+  File "C:\Users/Rong/AppData/Roaming/QGIS/QGIS3\profiles\default/python/plugins\s111_viewer\s111_viewer.py", line 1272, in create_vector_layer
+    current_data = current_reader.get_time_data(time_index)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users/Rong/AppData/Roaming/QGIS/QGIS3\profiles\default/python/plugins\s111_viewer\s111_viewer.py", line 790, in get_time_data
+    group = self.time_groups[time_index]
+            ^^^^^^^^^^^^^^^^
+AttributeError: 'S111Reader' object has no attribute 'time_groups'
+
+--------------------------------------------------
+[2025-06-05 06:10:47] 創建向量圖層時發生錯誤: 'S111Reader' object has no attribute 'time_group_objs'
+Traceback (most recent call last):
+  File "C:\Users/Rong/AppData/Roaming/QGIS/QGIS3\profiles\default/python/plugins\s111_viewer\s111_viewer.py", line 1272, in create_vector_layer
+    current_data = current_reader.get_time_data(time_index)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users/Rong/AppData/Roaming/QGIS/QGIS3\profiles\default/python/plugins\s111_viewer\s111_viewer.py", line 790, in get_time_data
+    group = self.time_group_objs[time_index]
+            ^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'S111Reader' object has no attribute 'time_group_objs'
+
+--------------------------------------------------
+[2025-06-05 06:12:37] 創建向量圖層時發生錯誤: 'Unable to synchronously open object (invalid identifier type to function)'
+Traceback (most recent call last):
+  File "C:\Users/Rong/AppData/Roaming/QGIS/QGIS3\profiles\default/python/plugins\s111_viewer\s111_viewer.py", line 1276, in create_vector_layer
+    current_data = current_reader.get_time_data(time_index)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users/Rong/AppData/Roaming/QGIS/QGIS3\profiles\default/python/plugins\s111_viewer\s111_viewer.py", line 795, in get_time_data
+    values = group['values'][:]  # 讀取全部資料
+             ~~~~~^^^^^^^^^^
+  File "h5py\\_objects.pyx", line 54, in h5py._objects.with_phil.wrapper
+  File "h5py\\_objects.pyx", line 55, in h5py._objects.with_phil.wrapper
+  File "C:\Users\Rong\AppData\Roaming\Python\Python312\site-packages\h5py\_hl\group.py", line 360, in __getitem__
+    oid = h5o.open(self.id, self._e(name), lapl=self._lapl)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "h5py\\_objects.pyx", line 54, in h5py._objects.with_phil.wrapper
+  File "h5py\\_objects.pyx", line 55, in h5py._objects.with_phil.wrapper
+  File "h5py\\h5o.pyx", line 257, in h5py.h5o.open
+KeyError: 'Unable to synchronously open object (invalid identifier type to function)'
+
+--------------------------------------------------

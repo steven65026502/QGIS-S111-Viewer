@@ -1,5 +1,5 @@
 <RCC>
-    <qresource prefix="/plugins/s111-viewer" >
+    <qresource prefix="/plugins/s111_viewer">
         <file>icon.png</file>
     </qresource>
 </RCC>
