@@ -42,7 +42,14 @@
    <item>
     <widget class="QGroupBox" name="groupDisplayOptions">
      <property name="title">
-      <string>顯示選項</string>
+      <string/>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QLabel" name="label">
+     <property name="text">
+      <string>動畫間隔：</string>
      </property>
     </widget>
    </item>
@@ -58,9 +65,109 @@
     </layout>
    </item>
    <item>
+    <widget class="QComboBox" name="comboBox">
+     <item>
+      <property name="text">
+       <string>15分鐘</string>
+      </property>
+     </item>
+     <item>
+      <property name="text">
+       <string>30分鐘</string>
+      </property>
+     </item>
+     <item>
+      <property name="text">
+       <string>45分鐘</string>
+      </property>
+     </item>
+     <item>
+      <property name="text">
+       <string>60分鐘</string>
+      </property>
+     </item>
+    </widget>
+   </item>
+   <item>
+    <widget class="QLabel" name="StartTime">
+     <property name="text">
+      <string>開始時間:</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QDateTimeEdit" name="dtStartTime">
+     <property name="date">
+      <date>
+       <year>2024</year>
+       <month>1</month>
+       <day>1</day>
+      </date>
+     </property>
+     <property name="maximumDateTime">
+      <datetime>
+       <hour>23</hour>
+       <minute>59</minute>
+       <second>59</second>
+       <year>9999</year>
+       <month>12</month>
+       <day>31</day>
+      </datetime>
+     </property>
+     <property name="maximumTime">
+      <time>
+       <hour>23</hour>
+       <minute>59</minute>
+       <second>59</second>
+      </time>
+     </property>
+     <property name="displayFormat">
+      <string>yyyy/MM/dd HH:mm</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QLabel" name="EndTime">
+     <property name="text">
+      <string>結束時間:</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QDateTimeEdit" name="dtEndTime">
+     <property name="date">
+      <date>
+       <year>2024</year>
+       <month>1</month>
+       <day>1</day>
+      </date>
+     </property>
+     <property name="maximumDateTime">
+      <datetime>
+       <hour>23</hour>
+       <minute>59</minute>
+       <second>59</second>
+       <year>9999</year>
+       <month>12</month>
+       <day>31</day>
+      </datetime>
+     </property>
+     <property name="maximumTime">
+      <time>
+       <hour>23</hour>
+       <minute>59</minute>
+       <second>59</second>
+      </time>
+     </property>
+     <property name="displayFormat">
+      <string>yyyy/MM/dd HH:mm</string>
+     </property>
+    </widget>
+   </item>
+   <item>
     <widget class="QLabel" name="lblCurrentTime">
      <property name="text">
-      <string>0:00</string>
+      <string/>
      </property>
     </widget>
    </item>
@@ -100,7 +207,7 @@
     </widget>
    </item>
    <item>
-    <widget class="QTextBrowser" name="txtMetadata">
+    <widget class="QTextBrowser" name="lblAnimationInterval">
      <property name="sizePolicy">
       <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
        <horstretch>1</horstretch>

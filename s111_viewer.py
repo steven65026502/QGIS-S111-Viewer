@@ -14,17 +14,18 @@
  ***************************************************************************/
 
 /***************************************************************************
- *                                                                         *
- *   This program is free software; you can redistribute it and/or modify  *
- *   it under the terms of the GNU General Public License as published by  *
- *   the Free Software Foundation; either version 2 of the License, or     *
- *   (at your option) any later version.                                   *
- *                                                                         *
+ * *
+ * This program is free software; you can redistribute it and/or modify  *
+ * it under the terms of the GNU General Public License as published by  *
+ * the Free Software Foundation; either version 2 of the License, or     *
+ * (at your option) any later version.                                   *
+ * *
  ***************************************************************************/
 """
 import os
 import sys
 import traceback
+import datetime
 
 # 添加 DLL 搜索路徑
 plugin_dir = os.path.dirname(os.path.abspath(__file__))
@@ -34,11 +35,12 @@ if os.path.exists(dll_path):
         os.environ['PATH'] = dll_path + os.pathsep + os.environ['PATH']
         print(f"已將 {dll_path} 添加到 PATH 環境變量")
 
-from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, Qt, QTimer, QVariant
+# --- MODIFIED: Added QDateTime for time range controls ---
+from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, Qt, QTimer, QVariant, QDateTime
 from qgis.core import (
     QgsProject, QgsVectorLayer, QgsFeature, QgsGeometry, 
     QgsPointXY, QgsField, QgsSingleSymbolRenderer, QgsSymbol,
-    QgsMarkerSymbol, QgsProperty, QgsArrowSymbolLayer, QgsRuleBasedRenderer, QgsLineSymbol, QgsLineString, QgsPoint, QgsFields, QgsSymbolLayer
+    QgsMarkerSymbol, QgsProperty, QgsArrowSymbolLayer, QgsRuleBasedRenderer, QgsLineSymbol, QgsLineString, QgsPoint, QgsFields, QgsSymbolLayer, QgsSvgMarkerSymbolLayer, QgsUnitTypes
 )
 from qgis.PyQt.QtGui import QIcon, QColor
 from qgis.PyQt.QtWidgets import (QAction, QFileDialog, QMessageBox, QColorDialog, 
@@ -80,18 +82,23 @@ class S111Standards:
     SLOW = 2.0   # 最小速度 (kn)
     SHIGH = 13.0 # 最大速度 (kn)
     
-    # 速度帶顏色方案 (根據 S-111 標準 Table 9-2)
+    # 速度帶顏色方案 (根據 S-111 標準 Table 9-2 - 日間顯示顏色)
+    # 使用官方規範的 RGB 顏色值
     SPEED_BANDS = [
-        (0.0, 0.5, '#7652E2'),   # Band 1: Purple
-        (0.5, 1.0, '#4898D3'),   # Band 2: Dark Blue
-        (1.0, 2.0, '#61CBE5'),   # Band 3: Light Blue
-        (2.0, 3.0, '#6DBC45'),   # Band 4: Dark Green
-        (3.0, 5.0, '#B4DC00'),   # Band 5: Light Green
-        (5.0, 7.0, '#CDC100'),   # Band 6: Yellow-Green
-        (7.0, 10.0, '#F8A718'),  # Band 7: Orange
-        (10.0, 13.0, '#F7A29D'), # Band 8: Pink
-        (13.0, float('inf'), '#FF1E1E')  # Band 9: Red
+        (0.0, 0.5, '#7652E2'),     # Band 1: 紫色 (RGB: 118, 82, 226)
+        (0.5, 1.0, '#4898D3'),     # Band 2: 深藍色 (RGB: 72, 152, 211)
+        (1.0, 2.0, '#61CBE5'),     # Band 3: 淺藍色 (RGB: 97, 203, 229)
+        (2.0, 3.0, '#6DBC45'),     # Band 4: 深綠色 (RGB: 109, 188, 69)
+        (3.0, 5.0, '#B4DC00'),     # Band 5: 淺綠色 (RGB: 180, 220, 0)
+        (5.0, 7.0, '#CDC100'),     # Band 6: 黃綠色 (RGB: 205, 193, 0)
+        (7.0, 10.0, '#F8A718'),    # Band 7: 橘色 (RGB: 248, 167, 24)
+        (10.0, 13.0, '#F7A29D'),   # Band 8: 粉紅色 (RGB: 247, 162, 157)
+        (13.0, float('inf'), '#FF1E1E')  # Band 9: 紅色 (RGB: 255, 30, 30)
     ]
+    
+    # 黑色邊框顏色 (根據 S-111 標準要求)
+    BORDER_COLOR = '#000000'  # 黑色邊框，確保在背景顏色相似時箭頭仍可見
+    BORDER_WIDTH = 0.05  # 邊框寬度 (mm) - 極細邊框以確保顏色可見
     
     @staticmethod
     def get_speed_band_color(speed_kn):
@@ -183,6 +190,8 @@ class S111MultiFileReader:
         self.files = {}  # 檔案字典: {filepath: S111Reader}
         self.current_file = None
         self.file_list = []  # 檔案路徑列表
+        self.global_timeline = []  # 全局唯一時間列表: [datetime1, datetime2, ...]
+        self.time_data_map = {}  # 時間數據地圖: {datetime: [(filepath, index_in_file), ...]}
         
     def add_files(self, filepaths):
         """添加多個S-111檔案
@@ -208,6 +217,10 @@ class S111MultiFileReader:
         # 設置第一個成功載入的檔案為當前檔案
         if successful_files and not self.current_file:
             self.current_file = successful_files[0]
+        
+        # 重新構建全局時間線
+        if successful_files:
+            self.build_global_timeline()
             
         return successful_files
     
@@ -258,6 +271,75 @@ class S111MultiFileReader:
             # 如果移除的是當前檔案，切換到下一個
             if filepath == self.current_file:
                 self.current_file = self.file_list[0] if self.file_list else None
+            
+            # 重新構建全局時間線
+            self.build_global_timeline()
+    
+    def build_global_timeline(self):
+        """
+        [新版] 構建全局時間線。
+        先將所有數據源按唯一的 datetime 進行分組，然後創建一個排序後的唯一時間戳列表。
+        """
+        # 1. 創建一個臨時的字典來分組
+        time_groups = {}
+
+        # 2. 遍歷所有檔案，將數據源信息分組
+        for filepath, reader in self.files.items():
+            for index, time_point in enumerate(reader.time_points):
+                # 確保時間點是有效的 datetime 物件
+                if not isinstance(time_point, datetime.datetime):
+                    continue
+
+                # 如果這個時間點是第一次出現，則創建一個新列表
+                if time_point not in time_groups:
+                    time_groups[time_point] = []
+                
+                # 將數據源信息 (檔案路徑, 檔案內索引) 加入到對應時間點的列表中
+                time_groups[time_point].append((filepath, index))
+
+        # 3. 將分組後的數據儲存到類屬性中
+        self.time_data_map = time_groups
+
+        # 4. 創建一個只包含唯一時間點的列表，並對其進行排序
+        self.global_timeline = sorted(time_groups.keys())
+
+        print(f"全局時間線構建完成，共有 {len(self.global_timeline)} 個唯一時間點。")
+        if self.global_timeline:
+            first_time = self.global_timeline[0]
+            sources_count = len(self.time_data_map.get(first_time, []))
+            print(f"  - 起始時間: {first_time} (有 {sources_count} 個數據源)")
+            last_time = self.global_timeline[-1]
+            sources_count = len(self.time_data_map.get(last_time, []))
+            print(f"  - 結束時間: {last_time} (有 {sources_count} 個數據源)")
+            
+            # 顯示重疊時間點的統計
+            multi_source_count = sum(1 for sources in self.time_data_map.values() if len(sources) > 1)
+            if multi_source_count > 0:
+                print(f"  - 共有 {multi_source_count} 個時間點包含多個數據源")
+    
+    def get_global_timeline_length(self):
+        """獲取全局時間線的長度
+        
+        Returns:
+            int: 全局時間線中的時間點數量
+        """
+        return len(self.global_timeline)
+    
+    def get_timeline_entry(self, global_index):
+        """根據全局索引獲取時間線條目
+        
+        Args:
+            global_index (int): 全局時間線中的索引
+            
+        Returns:
+            tuple: (datetime_obj, sources_list) 其中 sources_list = [(filepath, index_in_file), ...]
+            或者 None 如果索引無效
+        """
+        if 0 <= global_index < len(self.global_timeline):
+            datetime_obj = self.global_timeline[global_index]
+            sources_list = self.time_data_map.get(datetime_obj, [])
+            return (datetime_obj, sources_list)
+        return None
 
 class S111Reader:
     """S-111 文件讀取和解析類"""
@@ -269,6 +351,8 @@ class S111Reader:
         self.surfaces = []  # 每個時間點的流速和方向數據
         self.time_points = []  # 時間點列表
         self.geotransform = None  # 地理參考信息
+        self.data_format = None  # 數據編碼格式 (2 = Type 2, 3 = Type 3)
+        self.positioning_coordinates = None  # Type 3 點集合的地理座標
         
     def read_file(self, filename):
         """讀取 S-111 HDF5 文件
@@ -295,6 +379,8 @@ class S111Reader:
         self.surfaces = []
         self.time_points = []
         self.geotransform = None
+        self.data_format = None
+        self.positioning_coordinates = None
         
         try:
             # 添加調試信息
@@ -325,6 +411,22 @@ class S111Reader:
                     except:
                         pass
                 self.metadata[attr_name] = attr_value
+            
+            # 讀取數據編碼格式
+            data_format_found = False
+            if 'dataCodingFormat' in f.attrs:
+                self.data_format = int(f.attrs['dataCodingFormat'])
+                print(f"從根層讀取到數據編碼格式: {self.data_format}")
+                data_format_found = True
+            elif 'SurfaceCurrent' in f and 'dataCodingFormat' in f['SurfaceCurrent'].attrs:
+                self.data_format = int(f['SurfaceCurrent'].attrs['dataCodingFormat'])
+                print(f"從 SurfaceCurrent 組讀取到數據編碼格式: {self.data_format}")
+                data_format_found = True
+            
+            if not data_format_found:
+                # 默認假設為 Type 3 (點集合)
+                self.data_format = 3
+                print("未找到 dataCodingFormat 屬性，默認設為 Type 3")
             
             # 2. 遞歸探索 HDF5 文件結構
             def explore_group(group, prefix=""):
@@ -362,6 +464,9 @@ class S111Reader:
             
             # 嘗試設置地理參考信息
             self._set_geotransform(f)
+            
+            # 讀取地理座標數據（用於 Type 3 點集合）
+            self._load_positioning_coordinates(f)
             
             # 關閉文件
             f.close()
@@ -406,8 +511,9 @@ class S111Reader:
                     # 將數據上下翻轉
                     speed_flipped = np.flipud(speed)
                     direction_flipped = np.flipud(direction)
-                    # 如果找不到時間數據，使用默認值 0
-                    self.time_points.append(0)
+                    # 如果找不到時間數據，使用當前索引創建假的 datetime
+                    default_time = datetime.datetime(2000, 1, 1) + datetime.timedelta(seconds=len(self.time_points))
+                    self.time_points.append(default_time)
                     self.surfaces.append((speed_flipped, direction_flipped))
                     print(f"已讀取單個時間點的數據，速度形狀: {speed.shape}（已上下翻轉）")
                 except Exception as e:
@@ -430,6 +536,7 @@ class S111Reader:
             try:
                 # 讀取時間值
                 time_value = None
+                datetime_obj = None
                 for time_field in ['timePoint', 'timepoint', 'time', 'Time']:
                     if time_field in group.attrs:
                         time_value = group.attrs[time_field]
@@ -444,8 +551,25 @@ class S111Reader:
                         print(f"從數據集 {time_field} 讀取時間值: {time_value}")
                         break
                 
+                # 嘗試將時間字符串轉換為 datetime 對象
+                if time_value is not None and isinstance(time_value, str):
+                    try:
+                        # 嘗試解析 ISO 8601 格式的時間字符串
+                        if time_value.endswith('Z'):
+                            # 移除 Z 後綴並解析
+                            time_value_clean = time_value.rstrip('Z')
+                            datetime_obj = datetime.datetime.fromisoformat(time_value_clean)
+                        else:
+                            datetime_obj = datetime.datetime.fromisoformat(time_value)
+                        print(f"成功解析時間字符串為 datetime 對象: {datetime_obj}")
+                    except ValueError as e:
+                        print(f"無法解析時間字符串 '{time_value}': {e}")
+                        # 如果解析失敗，使用原始字符串
+                        datetime_obj = time_value
+                
                 if time_value is None:
                     time_value = len(self.time_points)
+                    datetime_obj = time_value
                     print(f"未找到時間數據，使用索引: {time_value}")
                 
                 # 讀取流速和方向
@@ -478,9 +602,10 @@ class S111Reader:
                 if speed is not None and direction is not None:
                     speed_flipped = np.flipud(speed)
                     direction_flipped = np.flipud(direction)
-                    self.time_points.append(time_value)
+                    # 存儲 datetime 對象到 time_points
+                    self.time_points.append(datetime_obj)
                     self.surfaces.append((speed_flipped, direction_flipped))
-                    print(f"成功讀取時間點 {time_value} 的數據（已上下翻轉）")
+                    print(f"成功讀取時間點 {datetime_obj} 的數據（已上下翻轉）")
                 else:
                     print(f"組 {group_name} 中未找到有效的速度或方向數據")
                     
@@ -543,7 +668,9 @@ class S111Reader:
                     # 將數據上下翻轉以修正方向問題
                     speed_data = np.flipud(speed_dataset[()])
                     direction_data = np.flipud(dir_dataset[()])
-                    self.time_points.append(0)  # 使用單個時間點
+                    # 使用默認的 datetime 對象
+                    default_time = datetime.datetime(2000, 1, 1) + datetime.timedelta(seconds=len(self.time_points))
+                    self.time_points.append(default_time)
                     self.surfaces.append((speed_data, direction_data))
                     print(f"成功讀取單個時間點的數據，形狀: {speed_dataset.shape}（已上下翻轉）")
 
@@ -566,7 +693,9 @@ class S111Reader:
                             # 將數據上下翻轉以修正方向問題
                             speed_data = np.flipud(speed_dataset[()])
                             direction_data = np.flipud(dir_dataset[()])
-                            self.time_points.append(len(self.time_points))
+                            # 使用默認的 datetime 對象
+                            default_time = datetime.datetime(2000, 1, 1) + datetime.timedelta(seconds=len(self.time_points))
+                            self.time_points.append(default_time)
                             self.surfaces.append((speed_data, direction_data))
                             print(f"成功讀取數據，形狀: {speed_dataset.shape}（已上下翻轉）")
 
@@ -626,7 +755,12 @@ class S111Reader:
                     
                     # 使用數據形狀估算分辨率
                     speed, _ = self.surfaces[0]
-                    height, width = speed.shape
+                    if len(speed.shape) >= 2:
+                        height, width = speed.shape
+                    else:
+                        # 對於一維數據（Type 3 點集合），使用數據長度
+                        height, width = 1, speed.shape[0]
+                        print(f"檢測到一維數據 (Type 3 點集合)，數據長度: {speed.shape[0]}")
                     
                     if 'east' in geo_values and 'west' in geo_values and 'xres' not in geo_values:
                         x_span = float(geo_values['east']) - float(geo_values['west'])
@@ -794,6 +928,76 @@ except ImportError as e:
     )
 
 
+# 這些方法應該添加到 S111Reader 類中，但由於縮排問題需要在類外定義
+# 然後動態添加到類中
+def _load_positioning_coordinates(self, file_obj):
+    """
+    一次性讀取並存儲地理座標數據（用於 Type 3 點集合）
+    
+    Args:
+        file_obj: HDF5 檔案對象
+    """
+    try:
+        # 只為 Type 3 數據讀取地理座標
+        if self.data_format != 3:
+            return
+            
+        # 嘗試尋找地理座標數據
+        positioning_paths = [
+            '/SurfaceCurrent/SurfaceCurrent.01/Positioning/geometryValues',
+            '/SurfaceCurrent/Positioning/geometryValues',
+            '/Positioning/geometryValues'
+        ]
+        
+        for path in positioning_paths:
+            try:
+                if self._path_exists_in_hdf5(file_obj, path):
+                    geometry_values = file_obj[path][()]
+                    print(f"從 {path} 讀取地理座標，形狀: {geometry_values.shape}")
+                    
+                    # 檢查數據結構
+                    if hasattr(geometry_values, 'dtype') and geometry_values.dtype.names:
+                        # 結構化陣列，包含 longitude 和 latitude 欄位
+                        if 'longitude' in geometry_values.dtype.names and 'latitude' in geometry_values.dtype.names:
+                            lons = geometry_values['longitude']
+                            lats = geometry_values['latitude']
+                            self.positioning_coordinates = np.column_stack((lons, lats))
+                            print(f"成功讀取並存儲 {len(self.positioning_coordinates)} 個座標點")
+                            return
+                    elif len(geometry_values.shape) == 2 and geometry_values.shape[1] == 2:
+                        # 直接的二維陣列 [longitude, latitude]
+                        self.positioning_coordinates = geometry_values
+                        print(f"成功讀取並存儲 {len(self.positioning_coordinates)} 個座標點")
+                        return
+                        
+            except Exception as e:
+                print(f"嘗試讀取路徑 {path} 時出錯: {e}")
+                continue
+        
+        print("未找到地理座標數據")
+        
+    except Exception as e:
+        print(f"讀取地理座標時出錯: {e}")
+
+def _path_exists_in_hdf5(self, hdf5_file, path):
+    """檢查 HDF5 檔案中是否存在指定路徑"""
+    try:
+        parts = path.strip('/').split('/')
+        current = hdf5_file
+        for part in parts:
+            if part in current:
+                current = current[part]
+            else:
+                return False
+        return True
+    except:
+        return False
+
+# 動態添加方法到 S111Reader 類
+S111Reader._load_positioning_coordinates = _load_positioning_coordinates
+S111Reader._path_exists_in_hdf5 = _path_exists_in_hdf5
+
+
 class S111Viewer:
     """QGIS Plugin Implementation."""
 
@@ -833,9 +1037,11 @@ class S111Viewer:
         self.dlg = None
         self.multi_reader = None  # 改為多檔案讀取器
         self.current_file = None
-        self.layers = []
+        self.flow_layer = None
         self.animation_timer = None
-        self.arrow_color = QColor(0, 0, 255)  # 默認藍色（將被S-111標準顏色覆蓋）
+        self.arrow_color = QColor(0, 0, 255)
+        # --- NEW: Added a list to store the filtered timeline ---
+        self.master_timeline = []
         
         # 創建日志目錄
         self.log_dir = os.path.join(self.plugin_dir, 'logs')
@@ -898,7 +1104,7 @@ class S111Viewer:
     def initGui(self):
         """Create the menu entries and toolbar icons inside the QGIS GUI."""
 
-        icon_path = ':/plugins/s111_viewer/icon.png'  # 修正連字符
+        icon_path = ':/plugins/s111_viewer/icon.png'
         self.add_action(
             icon_path,
             text=self.tr(u'S-111 Viewer'),
@@ -921,9 +1127,9 @@ class S111Viewer:
 
     def clear_layers(self):
         """清除所有已創建的圖層"""
-        for layer_id in self.layers:
-            QgsProject.instance().removeMapLayer(layer_id)
-        self.layers = []
+        if self.flow_layer:
+            QgsProject.instance().removeMapLayer(self.flow_layer)
+            self.flow_layer = None
 
     def log_error(self, message, show_dialog=True):
         """記錄錯誤信息到日志文件並可選擇性地顯示對話框"""
@@ -1046,7 +1252,28 @@ class S111Viewer:
                 # 設定 current_file 為最新加入的檔案
                 self.multi_reader.current_file = successful_files[-1]
                 self.update_file_list()
+
+                # 步驟一：先建立圖層，確保 flow_layer 已準備好
                 self.load_current_file()
+
+                # --- NEW: Set default values for QDateTimeEdit widgets and update range ---
+                if self.multi_reader.global_timeline:
+                    # Get the earliest and latest times
+                    first_time = self.multi_reader.global_timeline[0]
+                    last_time = self.multi_reader.global_timeline[-1]
+
+                    # Convert Python datetime to Qt QDateTime
+                    qt_first_time = QDateTime(first_time)
+                    qt_last_time = QDateTime(last_time)
+
+                    # Set default values for UI components
+                    if hasattr(self.dlg, 'dtStartTime') and hasattr(self.dlg, 'dtEndTime'):
+                        self.dlg.dtStartTime.setDateTime(qt_first_time)
+                        self.dlg.dtEndTime.setDateTime(qt_last_time)
+
+                    # 步驟二：在圖層建立後，再更新時間範圍並顯示第一筆資料
+                    self.update_time_range()
+                # --- End of new logic ---
                 
                 QMessageBox.information(
                     self.dlg,
@@ -1061,6 +1288,68 @@ class S111Viewer:
                     self.tr('載入錯誤'),
                     self.tr('未能載入任何檔案。請檢查檔案格式是否正確。')
                 )
+    
+    # --- NEW: Core logic function to filter the timeline and update the slider ---
+    def update_time_range(self):
+        """
+        Generates the Master Timeline based on user input with configurable intervals.
+        Displays data conditionally based on availability in the Data Timeline.
+        """
+        if not self.multi_reader or not self.multi_reader.global_timeline:
+            return
+
+        # Get the start and end times from the UI
+        start_dt = self.dlg.dtStartTime.dateTime().toPyDateTime()
+        end_dt = self.dlg.dtEndTime.dateTime().toPyDateTime()
+
+        # Get the selected animation interval from dropdown
+        from datetime import timedelta
+        interval_text = "60分鐘"  # Default value
+        if hasattr(self.dlg, 'comboBox'):
+            interval_text = self.dlg.comboBox.currentText()
+        
+        # Convert Chinese text to timedelta
+        interval_map = {
+            "15分鐘": timedelta(minutes=15),
+            "30分鐘": timedelta(minutes=30),
+            "45分鐘": timedelta(minutes=45),
+            "60分鐘": timedelta(minutes=60)
+        }
+        
+        interval = interval_map.get(interval_text, timedelta(minutes=60))
+        
+        self.master_timeline = []
+        current_t = start_dt
+        while current_t <= end_dt:
+            self.master_timeline.append(current_t)
+            current_t += interval
+
+        print(f"Master Timeline generated: {len(self.master_timeline)} time points from {start_dt} to {end_dt} ({interval_text} intervals).")
+
+        # Update the slider range to match the Master Timeline length
+        if self.master_timeline:
+            # Disconnect to avoid triggering update_time_display while setting values
+            try:
+                self.dlg.sliderTime.valueChanged.disconnect(self.update_time_display)
+            except TypeError:
+                pass
+
+            self.dlg.sliderTime.setEnabled(True)
+            self.dlg.sliderTime.setMinimum(0)
+            self.dlg.sliderTime.setMaximum(len(self.master_timeline) - 1)
+            self.dlg.sliderTime.setValue(0)
+
+            # Reconnect the signal
+            self.dlg.sliderTime.valueChanged.connect(self.update_time_display)
+
+            # Manually trigger the first display update
+            self.update_time_display(0)
+        else:
+            # If no time points are generated, disable the slider and clear the layer
+            self.dlg.sliderTime.setEnabled(False)
+            if self.flow_layer:
+                self.flow_layer.dataProvider().truncate()
+                self.flow_layer.triggerRepaint()
 
     def update_file_list(self):
         """更新檔案列表顯示"""
@@ -1081,13 +1370,95 @@ class S111Viewer:
                 self.dlg.fileListWidget.addItem(item)
 
     def on_file_selected(self, item):
-        """當用戶選擇檔案列表中的項目時"""
+        """[修正版]
+        當使用者點擊檔案列表中的項目時：
+        1. 更新元數據視窗以顯示該檔案的資訊。
+        2. 跳轉到該檔案在全局時間線中的第一個時間點。
+        """
         filepath = item.data(Qt.UserRole)
-        if filepath and self.multi_reader:
-            # 切換到選擇的檔案
-            self.multi_reader.set_current_file(filepath)
-            self.update_file_list()  # 更新高亮顯示
-            self.load_current_file()  # 載入新的當前檔案
+        if not filepath or not self.multi_reader:
+            return
+            
+        # ==================== 核心修改開始 ====================
+        # 1. 更新元數據顯示
+        if filepath in self.multi_reader.files and hasattr(self.dlg, 'txtMetadata'):
+            reader = self.multi_reader.files[filepath]
+            # 檢查 reader 是否有 get_metadata_text 方法
+            if hasattr(reader, 'get_metadata_text'):
+                self.dlg.txtMetadata.setText(reader.get_metadata_text())
+            else:
+                # 如果沒有該方法，手動構建元數據文本
+                metadata_text = self._format_metadata_for_reader(reader)
+                self.dlg.txtMetadata.setText(metadata_text)
+            print(f"元數據已更新為: {os.path.basename(filepath)}")
+        # ==================== 核心修改結束 ====================
+
+        # 1. 尋找與所選檔案關聯的第一個 datetime 物件
+        first_datetime_for_file = None
+        # 我們遍歷已排序的全局時間線 (其中只包含 datetime 物件)
+        for dt in self.multi_reader.global_timeline:
+            # 對於每一個時間點，去 time_data_map 中檢查其數據來源
+            sources_at_this_time = self.multi_reader.time_data_map.get(dt, [])
+            for src_filepath, src_index in sources_at_this_time:
+                if src_filepath == filepath:
+                    # 找到了！這就是該檔案第一次出現的時間點。
+                    first_datetime_for_file = dt
+                    break
+            if first_datetime_for_file:
+                break
+
+        # 2. 如果找到了時間點，就去全局時間線中找到它的索引位置
+        if first_datetime_for_file:
+            try:
+                # --- MODIFIED: Search in master_timeline instead of global_timeline ---
+                if first_datetime_for_file in self.master_timeline:
+                    target_slider_index = self.master_timeline.index(first_datetime_for_file)
+                    
+                    # 3. 移動滑塊到該索引位置
+                    if hasattr(self.dlg, 'sliderTime'):
+                        print(f"Jumping to start of file '{os.path.basename(filepath)}', slider index: {target_slider_index}")
+                        self.dlg.sliderTime.setValue(target_slider_index)
+                else:
+                    print(f"Info: The start time of file '{os.path.basename(filepath)}' is outside the current master time range.")
+
+            except ValueError:
+                print(f"Error: Could not find datetime {first_datetime_for_file} in the master timeline.")
+
+    def _format_metadata_for_reader(self, reader):
+        """
+        為 reader 格式化元數據文本（備用方法）
+        
+        Args:
+            reader: S111Reader 對象
+            
+        Returns:
+            str: 格式化的元數據文本
+        """
+        try:
+            metadata_lines = []
+            metadata_lines.append(f"檔案: {os.path.basename(reader.filename) if reader.filename else 'Unknown'}")
+            metadata_lines.append(f"數據格式: Type {reader.data_format if reader.data_format else 'Unknown'}")
+            metadata_lines.append(f"時間點數: {len(reader.time_points)}")
+            metadata_lines.append(f"數據點數: {len(reader.surfaces)}")
+            
+            # 添加一些基本的元數據信息
+            if hasattr(reader, 'metadata') and reader.metadata:
+                key_fields = ['productSpecification', 'issueDate', 'issueTime', 
+                             'eastBoundLongitude', 'westBoundLongitude', 
+                             'northBoundLatitude', 'southBoundLatitude']
+                
+                for key in key_fields:
+                    if key in reader.metadata:
+                        metadata_lines.append(f"{key}: {reader.metadata[key]}")
+            
+            # 如果有地理座標信息
+            if hasattr(reader, 'positioning_coordinates') and reader.positioning_coordinates is not None:
+                metadata_lines.append(f"座標點數: {len(reader.positioning_coordinates)}")
+            
+            return "\n".join(metadata_lines)
+            
+        except Exception as e:
+            return f"無法獲取元數據: {e}"
 
     def remove_selected_file(self):
         """移除選擇的檔案"""
@@ -1119,7 +1490,7 @@ class S111Viewer:
                 self.dlg.txtMetadata.clear()
 
     def load_current_file(self):
-        """載入當前選擇的檔案並顯示數據"""
+        """載入當前選擇的檔案並建立一個固定的圖層來顯示數據"""
         if not self.multi_reader or not self.multi_reader.current_file:
             print("錯誤: 沒有選擇檔案")
             return
@@ -1129,30 +1500,28 @@ class S111Viewer:
             if not current_reader:
                 print("錯誤: 無法獲取當前讀取器")
                 return
-                
-            # 獲取時間點數量
-            time_count = len(current_reader.time_points)
-            if time_count == 0:
-                print("錯誤: 沒有時間點數據")
-                return
-                
-            # 更新時間滑塊
-            if hasattr(self.dlg, 'sliderTime'):
-                self.dlg.sliderTime.setMaximum(time_count - 1)
-                self.dlg.sliderTime.setValue(0)
-                self.dlg.sliderTime.setEnabled(True)
-                
-            # 更新時間標籤
-            if hasattr(self.dlg, 'lblCurrentTime'):
-                self.dlg.lblCurrentTime.setText(str(current_reader.time_points[0]))
-                
-            # 創建向量圖層
-            self.create_vector_layer(0)
             
-            # 更新元數據顯示
-            if hasattr(self.dlg, 'txtMetadata'):
-                self.dlg.txtMetadata.setText(current_reader.get_metadata_text())
+            # This logic is now handled by update_time_range, so we simplify this function
+            # The main goal here is to ensure the persistent layer is set up.
                 
+            # 載入新檔案前，先清除舊的固定圖層 (if any)
+            self.clear_layers()
+            
+            # 建立一個固定的向量圖層 (只做一次)
+            self.setup_persistent_layer()
+
+            # 如果圖層成功建立
+            if self.flow_layer:
+                # 更新元數據顯示
+                if hasattr(self.dlg, 'txtMetadata'):
+                    self.dlg.txtMetadata.setText(current_reader.get_metadata_text())
+                    
+                # The first display update is now triggered by update_time_range
+                
+                # 縮放到圖層範圍
+                self.iface.mapCanvas().setExtent(self.flow_layer.extent())
+                self.iface.mapCanvas().refresh()
+
         except Exception as e:
             print(f"載入檔案時出錯: {e}")
             print(traceback.format_exc())
@@ -1198,261 +1567,378 @@ class S111Viewer:
                 return True
         return False
 
-    def remove_old_s111_flow_layers(self, file_code):
-        """移除所有同一檔案（不管時間步）的 S111_Flow 圖層"""
-        project = QgsProject.instance()
-        layers_to_remove = []
-        prefix = f'S111_Flow_{file_code}'
-        for layer in project.mapLayers().values():
-            if layer.name().startswith(prefix):
-                layers_to_remove.append(layer.id())
-        for lid in layers_to_remove:
-            project.removeMapLayer(lid)
-        self.layers = []
-
-    def create_vector_layer(self, time_index):
-        """創建向量圖層顯示指定時間點的海流數據"""
-        print(f"create_vector_layer 被調用: 時間索引 = {time_index}")
+    def setup_persistent_layer(self):
+        """
+        建立一個固定的、可重複使用的全局向量圖層。
+        這個圖層將作為"舞台"，動態顯示來自不同檔案的數據。
+        """
+        # 使用一個通用的、有意義的圖層名稱
+        layer_name = "S111 Global Flow Data"
         
-        if not self.multi_reader:
-            print("錯誤: multi_reader 不存在")
-            return None
-            
-        current_reader = self.multi_reader.get_current_reader()
-        if not current_reader:
-            print("錯誤: 當前讀取器不存在")
-            return None
-            
-        if not current_reader.surfaces:
-            print("錯誤: 沒有表面數據")
-            return None
-            
-        if time_index >= len(current_reader.surfaces):
-            print(f"錯誤: 時間索引 {time_index} 超出範圍 0-{len(current_reader.surfaces)-1}")
-            return None
-        
-        # 圖層名稱
-        filename = os.path.basename(self.multi_reader.current_file)
-        layer_name = f"S111_Flow_{filename}_{time_index}"
+        # 檢查圖層是否已存在，避免重複創建
         if self.layer_exists(layer_name):
-            print(f"圖層 {layer_name} 已存在，跳過新增。")
-            return
+            # 如果已存在，獲取它的引用
+            existing_layers = QgsProject.instance().mapLayersByName(layer_name)
+            if existing_layers:
+                self.flow_layer = existing_layers[0]
+                print(f"已找到現有的固定圖層: {layer_name}")
+                return
+
+        # 創建臨時向量圖層
+        self.flow_layer = QgsVectorLayer("Point?crs=EPSG:4326", layer_name, "memory")
         
+        # 添加屬性（包括Source字段）
+        fields = QgsFields()
         try:
-            # 在加新圖層前先移除舊的 S111_Flow 圖層
-            self.remove_old_s111_flow_layers(filename)
-            
-            # 獲取當前時間點的數據
-            surface_data = current_reader.surfaces[time_index]
-            speed, direction = surface_data
-            
-            # 獲取地理參考信息
-            geotransform = current_reader.geotransform
-            if not geotransform:
-                print("警告: 沒有地理參考信息，使用默認值")
-                geotransform = [118.0, 0.01, 0, 22.0, 0, -0.01]
-            
-            # 創建臨時向量圖層
-            vl = QgsVectorLayer("Point?crs=EPSG:4326", layer_name, "memory")
-            
-            # 添加屬性
-            fields = QgsFields()
+            # 嘗試使用新的 QMetaType 語法 (QGIS 3.20+)
+            from qgis.PyQt.QtCore import QMetaType
+            fields.append(QgsField("Longitude", QMetaType.Type.Double))
+            fields.append(QgsField("Latitude", QMetaType.Type.Double))
+            fields.append(QgsField("Speed", QMetaType.Type.Double))
+            fields.append(QgsField("Direction", QMetaType.Type.Double))
+            fields.append(QgsField("Source", QMetaType.Type.QString))
+            fields.append(QgsField("merged_sources", QMetaType.Type.QString))
+            fields.append(QgsField("all_speeds", QMetaType.Type.QString))
+            fields.append(QgsField("merged_count", QMetaType.Type.Int))
+        except (ImportError, AttributeError):
+            # 回退到舊語法以保持兼容性
+            fields.append(QgsField("Longitude", QVariant.Double))
+            fields.append(QgsField("Latitude", QVariant.Double))
             fields.append(QgsField("Speed", QVariant.Double))
             fields.append(QgsField("Direction", QVariant.Double))
             fields.append(QgsField("Source", QVariant.String))
-            vl.dataProvider().addAttributes(fields)
-            vl.updateFields()
-            
-            # 創建特徵
-            features = []
-            height, width = speed.shape
-            step = max(1, min(height, width) // 30)  # 採樣步長
-            
-            for y in range(0, height, step):
-                for x in range(0, width, step):
-                    try:
-                        s = float(speed[y, x])
-                        d = float(direction[y, x])
-                        # 過濾缺值
-                        if s > 0 and s != -9999 and d != -9999:
-                            # 計算地理坐標
-                            lon = geotransform[0] + x * geotransform[1]
-                            lat = geotransform[3] + y * geotransform[5]
-                            
-                            # 創建特徵
-                            feature = QgsFeature()
-                            feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
-                            feature.setAttributes([s, d, filename])
-                            features.append(feature)
-                    except Exception as e:
-                        continue
-            
-            # 添加特徵到圖層
-            if features:
-                vl.dataProvider().addFeatures(features)
-                vl.updateExtents()
-                
-                # 設置符號
-                self.apply_s111_standard_symbology(vl)
-                
-                # 添加到項目
-                QgsProject.instance().addMapLayer(vl)
-                self.layers.append(vl.id())
-                
-                # 縮放到所有圖層的範圍
-                if time_index == 0:
-                    self.zoom_to_all_layers()
-                
-                print(f"成功創建圖層 {layer_name}，包含 {len(features)} 個特徵")
-                print("Speed max/min:", np.nanmax(speed), np.nanmin(speed))
-                print("Direction max/min:", np.nanmax(direction), np.nanmin(direction))
-                print("Feature count:", len(features))
-                return vl.id()
-            else:
-                print("警告: 沒有有效的特徵被創建")
-                return None
-                
-        except Exception as e:
-            print(f"創建向量圖層時出錯: {e}")
-            print(traceback.format_exc())
-            return None
+            fields.append(QgsField("merged_sources", QVariant.String))
+            fields.append(QgsField("all_speeds", QVariant.String))
+            fields.append(QgsField("merged_count", QVariant.Int))
+        self.flow_layer.dataProvider().addAttributes(fields)
+        self.flow_layer.updateFields()
+        
+        # 設置符號系統
+        self.apply_s111_standard_symbology(self.flow_layer)
+        
+        # 添加到項目
+        QgsProject.instance().addMapLayer(self.flow_layer)
+        print(f"已成功建立固定的全局圖層: {layer_name}")
+
+
 
     def zoom_to_all_layers(self):
-        """縮放到所有圖層的範圍"""
-        if not self.layers:
+        """縮放到固定圖層的範圍"""
+        if not self.flow_layer:
             return
             
-        # 創建一個空的範圍
-        combined_extent = None
-        
-        # 合併所有圖層的範圍
-        for layer_id in self.layers:
-            layer = QgsProject.instance().mapLayer(layer_id)
-            if layer:
-                if combined_extent is None:
-                    combined_extent = layer.extent()
-                else:
-                    combined_extent.combineExtentWith(layer.extent())
-        
         # 設置地圖畫布的範圍
-        if combined_extent:
-            self.iface.mapCanvas().setExtent(combined_extent)
-            self.iface.mapCanvas().refresh()
+        self.iface.mapCanvas().setExtent(self.flow_layer.extent())
+        self.iface.mapCanvas().refresh()
 
     def apply_s111_standard_symbology(self, layer):
         """應用 S-111 標準符號設置到圖層"""
         try:
-            # 創建箭頭符號
-            symbol = QgsMarkerSymbol.createSimple({
-                'name': 'arrow',
-                'color': '0,100,255',
-                'outline_color': 'black',
-                'outline_width': '0.5',
-                'size': '5',
-                'size_unit': 'MM'
-            })
+            print(f"開始應用 S-111 標準符號到圖層: {layer.name()}")
             
-            # 設置箭頭大小基於速度 (使用 S-111 標準計算)
-            size_expr = """
-            CASE
-                WHEN "Speed" <= 2.0 THEN 10.0 * ("Speed" / 2.0)
-                WHEN "Speed" >= 13.0 THEN 10.0 * ("Speed" / 5.0)
-                ELSE 10.0
-            END
-            """
-            size_prop = QgsProperty.fromExpression(size_expr)
-            symbol.symbolLayer(0).setDataDefinedProperty(QgsSymbolLayer.PropertySize, size_prop)
+            # 檢查圖層是否有效
+            if not layer or not layer.isValid():
+                print("錯誤: 圖層無效，無法應用符號")
+                return
+                
+            # 檢查圖層是否有特徵
+            feature_count = layer.featureCount()
+            print(f"圖層特徵數量: {feature_count}")
             
-            # 設置箭頭方向 (真北為0度，順時針為正)
-            angle_prop = QgsProperty.fromExpression('"Direction"')
-            symbol.symbolLayer(0).setDataDefinedProperty(QgsSymbolLayer.PropertyAngle, angle_prop)
+            if feature_count == 0:
+                print("警告: 圖層沒有特徵，符號可能不會顯示")
             
-            # 設置箭頭顏色基於速度帶
-            color_expr = """
-            CASE
-                WHEN "Speed" <= 0.5 THEN '#7652E2'
-                WHEN "Speed" <= 1.0 THEN '#4898D3'
-                WHEN "Speed" <= 2.0 THEN '#61CBE5'
-                WHEN "Speed" <= 3.0 THEN '#6DBC45'
-                WHEN "Speed" <= 5.0 THEN '#B4DC00'
-                WHEN "Speed" <= 7.0 THEN '#CDC100'
-                WHEN "Speed" <= 10.0 THEN '#F8A718'
-                WHEN "Speed" <= 13.0 THEN '#F7A29D'
-                ELSE '#FF1E1E'
-            END
-            """
-            color_prop = QgsProperty.fromExpression(color_expr)
-            symbol.symbolLayer(0).setDataDefinedProperty(QgsSymbolLayer.PropertyFillColor, color_prop)
+            # 使用規則化渲染器來根據速度選擇不同的符號
+            from qgis.core import QgsRuleBasedRenderer, QgsSvgMarkerSymbolLayer, QgsSymbolLayer
             
-            # 應用渲染器
-            renderer = QgsSingleSymbolRenderer(symbol)
-            layer.setRenderer(renderer)
+            # 創建規則化渲染器
+            root_rule = QgsRuleBasedRenderer.Rule(None)
             
-            # 觸發重繪
-            layer.triggerRepaint()
-            print("成功應用 S-111 標準箭頭符號")
+            # 獲取速度帶定義
+            speed_bands = S111Standards.SPEED_BANDS
+            print(f"將創建 {len(speed_bands)} 個速度帶的符號")
             
+            for i, (min_speed, max_speed, color) in enumerate(speed_bands):
+                band_num = i + 1
+                
+                # 嘗試創建獨立的 SVG 符號（不依賴外部 CSS）
+                svg_content = self.create_independent_svg_symbol(color, S111Standards.BORDER_COLOR, S111Standards.BORDER_WIDTH)
+                
+                use_svg = False
+                if svg_content:
+                    try:
+                        # 創建臨時 SVG 檔案
+                        import tempfile
+                        with tempfile.NamedTemporaryFile(mode='w', suffix='.svg', delete=False) as temp_svg:
+                            temp_svg.write(svg_content)
+                            temp_svg_path = temp_svg.name
+                        
+                        # 創建 SVG 符號
+                        symbol = QgsMarkerSymbol()
+                        symbol.deleteSymbolLayer(0)  # 移除默認符號層
+                        
+                        # 添加 SVG 符號層
+                        svg_layer = QgsSvgMarkerSymbolLayer(temp_svg_path)
+                        
+                        # 設置 SVG 大小 (使用 S-111 標準計算)
+                        size_expr = f"""
+                        CASE
+                            WHEN "Speed" <= {S111Standards.SLOW} THEN {S111Standards.HREF} * ("Speed" / {S111Standards.SLOW})
+                            WHEN "Speed" >= {S111Standards.SHIGH} THEN {S111Standards.HREF} * ("Speed" / {S111Standards.SREF})
+                            ELSE {S111Standards.HREF}
+                        END
+                        """
+                        size_prop = QgsProperty.fromExpression(size_expr)
+                        svg_layer.setDataDefinedProperty(QgsSymbolLayer.PropertySize, size_prop)
+                        svg_layer.setSizeUnit(QgsUnitTypes.RenderMillimeters)
+                        
+                        # 設置旋轉角度 (S-111 標準：真北為0度，順時針為正)
+                        angle_prop = QgsProperty.fromExpression('"Direction"')
+                        svg_layer.setDataDefinedProperty(QgsSymbolLayer.PropertyAngle, angle_prop)
+                        
+                        # 設置默認大小
+                        svg_layer.setSize(8.0)  # 默認 8mm
+                        
+                        symbol.appendSymbolLayer(svg_layer)
+                        use_svg = True
+                        
+                        print(f"成功創建速度帶 {band_num} 的獨立 SVG 符號，顏色: {color}")
+                        
+                    except Exception as svg_error:
+                        print(f"獨立 SVG 符號創建失敗，使用自定義箭頭: {svg_error}")
+                        use_svg = False
+                        # 清理臨時檔案
+                        try:
+                            os.unlink(temp_svg_path)
+                        except:
+                            pass
+                
+                if not use_svg:
+                    # 使用自定義箭頭符號，可完全控制顏色和邊框
+                    symbol = QgsMarkerSymbol.createSimple({
+                        'name': 'arrow',
+                        'color': color,  # 使用 S-111 規範顏色
+                        'outline_color': S111Standards.BORDER_COLOR,  # 黑色邊框
+                        'outline_width': str(S111Standards.BORDER_WIDTH),  # 使用極細邊框寬度
+                        'outline_width_unit': 'MM',
+                        'size': '8',
+                        'size_unit': 'MM'
+                    })
+                    
+                    # 設置動態大小 (根據 S-111 標準)
+                    size_expr = f"""
+                    CASE
+                        WHEN "Speed" <= {S111Standards.SLOW} THEN {S111Standards.HREF} * ("Speed" / {S111Standards.SLOW})
+                        WHEN "Speed" >= {S111Standards.SHIGH} THEN {S111Standards.HREF} * ("Speed" / {S111Standards.SREF})
+                        ELSE {S111Standards.HREF}
+                    END
+                    """
+                    symbol.symbolLayer(0).setDataDefinedProperty(
+                        QgsSymbolLayer.PropertySize, 
+                        QgsProperty.fromExpression(size_expr)
+                    )
+                    
+                    # 設置動態旋轉角度 (S-111 標準：真北為0度，順時針為正)
+                    # QGIS 箭頭默認朝上，需要調整角度
+                    symbol.symbolLayer(0).setDataDefinedProperty(
+                        QgsSymbolLayer.PropertyAngle, 
+                        QgsProperty.fromExpression('"Direction"')
+                    )
+                    
+                    print(f"成功創建速度帶 {band_num} 的自定義箭頭符號，顏色: {color}")
+                
+                # 創建規則表達式
+                if max_speed == float('inf'):
+                    rule_expr = f'"Speed" >= {min_speed}'
+                    max_label = "∞"
+                else:
+                    rule_expr = f'"Speed" >= {min_speed} AND "Speed" < {max_speed}'
+                    max_label = str(max_speed)
+                
+                # 創建並添加規則
+                rule = QgsRuleBasedRenderer.Rule(
+                    symbol, 
+                    0, 
+                    0, 
+                    rule_expr, 
+                    f'速度帶 {band_num} ({min_speed}-{max_label} 節) - {color}'
+                )
+                root_rule.appendChild(rule)
+                
+                print(f"已添加速度帶 {band_num}: {min_speed}-{max_label} 節，顏色: {color}")
+            
+            # 如果成功創建了規則，應用規則化渲染器
+            if root_rule.children():
+                renderer = QgsRuleBasedRenderer(root_rule)
+                layer.setRenderer(renderer)
+                
+                # 觸發重繪
+                layer.triggerRepaint()
+                print(f"成功應用 S-111 標準符號系統，共 {len(root_rule.children())} 個速度帶")
+                print("所有符號均包含極細黑色邊框，主要顏色清楚可見")
+            else:
+                print("未能創建任何有效的符號規則，使用備用方案")
+                self.apply_simple_arrow_symbology(layer)
+                
         except Exception as e:
-            print(f"應用符號時出錯: {e}")
+            print(f"應用 S-111 標準符號時出錯: {e}")
             print(traceback.format_exc())
             # 使用簡單符號作為備用
             self.apply_simple_arrow_symbology(layer)
+    
+    def create_independent_svg_symbol(self, fill_color, stroke_color, stroke_width):
+        """創建不依賴外部 CSS 的獨立 SVG 符號
+        
+        Args:
+            fill_color (str): 填充顏色 (十六進制)
+            stroke_color (str): 邊框顏色 (十六進制)
+            stroke_width (float): 邊框寬度 (mm)
+            
+        Returns:
+            str: SVG 內容字符串
+        """
+        try:
+            # 基於官方 S-111 箭頭路徑的獨立 SVG
+            svg_content = f'''<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" version="1.2" baseProfile="tiny" xml:space="preserve" 
+     style="shape-rendering:geometricPrecision; fill-rule:evenodd;" 
+     width="6mm" height="11mm" viewBox="-3 -5.5 6 11">
+<title>S111 Arrow Symbol</title>
+<desc>Surface Current Vector - Independent SVG</desc>
+<path d="M 0,5 L -0.5,5 L -1.0,-1.5 L -2.0,-1.5 L 0,-5 L 2.0,-1.5 L 1.0,-1.5 L 0.5,5 L 0,5 Z" 
+      fill="{fill_color}" 
+      stroke="{stroke_color}" 
+      stroke-width="{stroke_width}"
+      stroke-linecap="round" 
+      stroke-linejoin="round"/>
+</svg>'''
+            return svg_content
+        except Exception as e:
+            print(f"創建獨立 SVG 符號時出錯: {e}")
+            return None
 
     def apply_simple_arrow_symbology(self, layer):
-        """應用簡單的箭頭符號（備用方案）"""
+        """應用簡單的箭頭符號（備用方案）- 符合 S-111 規範"""
         try:
-            # 創建基本箭頭符號
-            symbol = QgsMarkerSymbol.createSimple({
-                'name': 'arrow',
-                'color': '0,100,255',
-                'outline_color': 'black',
-                'outline_width': '0.5',
-                'size': '5',
-                'size_unit': 'MM'
-            })
+            # 使用規則化渲染器以支援不同速度帶的顏色
+            from qgis.core import QgsRuleBasedRenderer
             
-            # 設置基本大小和方向
-            symbol.symbolLayer(0).setDataDefinedProperty(QgsSymbolLayer.PropertySize, QgsProperty.fromExpression('"Speed" * 2'))
-            symbol.symbolLayer(0).setDataDefinedProperty(QgsSymbolLayer.PropertyAngle, QgsProperty.fromExpression('90 - "Direction"'))
+            root_rule = QgsRuleBasedRenderer.Rule(None)
             
-            # 應用渲染器
-            renderer = QgsSingleSymbolRenderer(symbol)
-            layer.setRenderer(renderer)
+            # 為每個速度帶創建規則
+            for i, (min_speed, max_speed, color) in enumerate(S111Standards.SPEED_BANDS):
+                band_num = i + 1
+                
+                # 創建符合 S-111 規範的箭頭符號
+                symbol = QgsMarkerSymbol.createSimple({
+                    'name': 'arrow',
+                    'color': color,  # 使用 S-111 規範顏色
+                    'outline_color': S111Standards.BORDER_COLOR,  # 黑色邊框
+                    'outline_width': str(S111Standards.BORDER_WIDTH),  # 使用極細邊框寬度
+                    'outline_width_unit': 'MM',
+                    'size': '8',  # 默認大小
+                    'size_unit': 'MM'
+                })
+                
+                # 設置動態大小 (根據 S-111 標準計算)
+                size_expr = f"""
+                CASE
+                    WHEN "Speed" <= {S111Standards.SLOW} THEN {S111Standards.HREF} * ("Speed" / {S111Standards.SLOW})
+                    WHEN "Speed" >= {S111Standards.SHIGH} THEN {S111Standards.HREF} * ("Speed" / {S111Standards.SREF})
+                    ELSE {S111Standards.HREF}
+                END
+                """
+                symbol.symbolLayer(0).setDataDefinedProperty(
+                    QgsSymbolLayer.PropertySize, 
+                    QgsProperty.fromExpression(size_expr)
+                )
+                
+                # 設置動態旋轉角度 (S-111 標準：真北為0度，順時針為正)
+                symbol.symbolLayer(0).setDataDefinedProperty(
+                    QgsSymbolLayer.PropertyAngle, 
+                    QgsProperty.fromExpression('"Direction"')
+                )
+                
+                # 創建規則表達式
+                if max_speed == float('inf'):
+                    rule_expr = f'"Speed" >= {min_speed}'
+                    max_label = "∞"
+                else:
+                    rule_expr = f'"Speed" >= {min_speed} AND "Speed" < {max_speed}'
+                    max_label = str(max_speed)
+                
+                # 創建並添加規則
+                rule = QgsRuleBasedRenderer.Rule(
+                    symbol, 
+                    0, 
+                    0, 
+                    rule_expr, 
+                    f'速度帶 {band_num} ({min_speed}-{max_label} 節) - {color}'
+                )
+                root_rule.appendChild(rule)
+                
+                print(f"備用方案: 已添加速度帶 {band_num}，顏色: {color}")
             
-            # 觸發重繪
-            layer.triggerRepaint()
-            print("成功應用簡單箭頭符號")
+            # 應用規則化渲染器
+            if root_rule.children():
+                renderer = QgsRuleBasedRenderer(root_rule)
+                layer.setRenderer(renderer)
+                
+                # 觸發重繪
+                layer.triggerRepaint()
+                print("成功應用備用箭頭符號（符合 S-111 規範的顏色和黑色邊框）")
+            else:
+                # 最後的備用方案：單一符號
+                symbol = QgsMarkerSymbol.createSimple({
+                    'name': 'arrow',
+                    'color': S111Standards.SPEED_BANDS[4][2],  # 使用中等速度的顏色
+                    'outline_color': S111Standards.BORDER_COLOR,  # 黑色邊框
+                    'outline_width': str(S111Standards.BORDER_WIDTH),  # 使用極細邊框寬度
+                    'outline_width_unit': 'MM',
+                    'size': '8',
+                    'size_unit': 'MM'
+                })
+                
+                # 設置基本大小和方向
+                symbol.symbolLayer(0).setDataDefinedProperty(
+                    QgsSymbolLayer.PropertySize, 
+                    QgsProperty.fromExpression('"Speed" * 2')
+                )
+                symbol.symbolLayer(0).setDataDefinedProperty(
+                    QgsSymbolLayer.PropertyAngle, 
+                    QgsProperty.fromExpression('"Direction"')
+                )
+                
+                # 應用渲染器
+                renderer = QgsSingleSymbolRenderer(symbol)
+                layer.setRenderer(renderer)
+                
+                # 觸發重繪
+                layer.triggerRepaint()
+                print("應用最基本的備用箭頭符號（包含黑色邊框）")
             
         except Exception as e:
             print(f"應用簡單箭頭符號時出錯: {e}")
             print(traceback.format_exc())
-        
+
     def start_animation(self):
         """開始播放動畫"""
         print("開始播放動畫函數被調用")
         
-        if not self.multi_reader:
-            print("錯誤: multi_reader 不存在")
-            return
-            
-        current_reader = self.multi_reader.get_current_reader()
-        if not current_reader:
-            print("錯誤: 沒有當前讀取器")
-            return
-            
-        if not current_reader.surfaces:
-            print("錯誤: 沒有表面數據")
+        # --- MODIFIED: Check master_timeline instead of global_timeline ---
+        if not self.master_timeline:
+            print("錯誤: 主時間線為空，無法播放動畫")
+            QMessageBox.warning(self.dlg, "錯誤", "沒有在指定時間範圍內可播放的數據。")
             return
                 
-        print(f"時間點數量: {len(current_reader.surfaces)}")
-        print(f"時間點列表: {current_reader.time_points}")
+        print(f"主時間線時間點數量: {len(self.master_timeline)}")
         
         if not self.animation_timer:
             self.animation_timer = QTimer()
             self.animation_timer.timeout.connect(self.next_frame)
             
         # 設置動畫速度
-        interval = 500  # 毫秒
+        interval = 2000  # 毫秒
         self.animation_timer.start(interval)
         print(f"動畫計時器已啟動，間隔: {interval}ms")
         
@@ -1525,55 +2011,642 @@ class S111Viewer:
         self.iface.mapCanvas().setExtent(current_extent)
         self.iface.mapCanvas().refresh()
             
-    def update_time_display(self, value):
-        """更新時間顯示和當前顯示的圖層"""
-        print(f"update_time_display 被調用: 時間索引 = {value}")
+    # --- MODIFIED: This function now works with the filtered timeline ---
+    def update_time_display(self, slider_index):
+        """
+        Handler for the slider's valueChanged signal.
+        This corrected logic guarantees the UI time label is always updated first.
+        """
+        print(f"update_time_display called: master index = {slider_index}")
+
+        # Pre-condition: Validate that the slider_index is within bounds
+        if not self.flow_layer or not self.master_timeline or not (0 <= slider_index < len(self.master_timeline)):
+            print("Error: Invalid index or empty master timeline")
+            return
+
+        # 1. Get current time from Master Timeline using the slider's index
+        current_datetime = self.master_timeline[slider_index]
+
+        # 2. **UNCONDITIONAL UI UPDATE (THE FIX):**
+        # Immediately update the UI label's text. This operation is now decoupled
+        # from the data lookup and executes on every call to this function.
+        if hasattr(self.dlg, 'lblCurrentTime'):
+            formatted_time = current_datetime.strftime("%Y-%m-%d %H:%M:%S")
+            self.dlg.lblCurrentTime.setText(formatted_time)
+
+        # --- 全新的、支援「持續顯示」的最終邏輯 ---
+
+        # 1. 準備一個字典，用來存放每個檔案在當前時間點應該顯示的資料來源
+        sources_to_display = {}
+
+        # 2. 遍歷所有已載入的檔案，為每個檔案找到最適合顯示的資料時間點
+        start_dt = self.dlg.dtStartTime.dateTime().toPyDateTime()
+        end_dt = self.dlg.dtEndTime.dateTime().toPyDateTime()
         
-        if not self.multi_reader:
-            print("錯誤: multi_reader 不存在")
-            return
+        for filepath, reader in self.multi_reader.files.items():
+            filename = os.path.basename(filepath)
+            print(f"🔍 處理檔案: {filename}")
             
-        current_reader = self.multi_reader.get_current_reader()
-        if not current_reader:
-            print("錯誤: 沒有當前讀取器")
-            return
-            
-        if not current_reader.time_points:
-            print("錯誤: 沒有時間點數據")
-            return
-            
-        if 0 <= value < len(current_reader.time_points):
-            # 保存當前視圖範圍
-            current_extent = self.iface.mapCanvas().extent()
-            
-            # 更新時間標籤
-            time_str = str(current_reader.time_points[value])
-            print(f"設置時間標籤: {time_str}")
-            if hasattr(self.dlg, 'lblCurrentTime'):
-                self.dlg.lblCurrentTime.setText(time_str)
-            
-            # 更新顯示的圖層
-            print(f"創建時間索引 {value} 的向量圖層")
-            self.create_vector_layer(value)
-            
-            # 恢復視圖範圍
-            self.iface.mapCanvas().setExtent(current_extent)
+            # 找出該檔案在使用者設定範圍內的所有時間點
+            valid_timestamps_in_range = [
+                (idx, ts) for idx, ts in enumerate(reader.time_points) 
+                if start_dt <= ts <= end_dt
+            ]
+
+            print(f"  📅 範圍內時間點: {len(valid_timestamps_in_range)} 個")
+            for idx, (file_idx, ts) in enumerate(valid_timestamps_in_range):
+                time_diff = abs((ts - current_datetime).total_seconds()) / 3600.0  # 轉換為小時
+                print(f"    時間點 {idx+1}: {ts.strftime('%H:%M')} (距離目標 {time_diff:.1f} 小時)")
+
+            if valid_timestamps_in_range:
+                # 檢查檔案是否已經播放完畢
+                file_last_timestamp = max(reader.time_points)
+                file_first_timestamp = min(reader.time_points)
+                
+                print(f"  📊 檔案時間範圍: {file_first_timestamp.strftime('%m-%d %H:%M')} ~ {file_last_timestamp.strftime('%m-%d %H:%M')}")
+                print(f"  🎯 當前動畫時間: {current_datetime.strftime('%m-%d %H:%M')}")
+                
+                # 如果當前動畫時間已經超過檔案的最後時間點，該檔案應該被清除
+                if current_datetime > file_last_timestamp:
+                    print(f"  ❌ 檔案已播放完畢，不顯示 (最後時間點: {file_last_timestamp.strftime('%m-%d %H:%M')})")
+                    continue  # 跳過這個檔案，不顯示其資料
+                
+                # 如果當前動畫時間還沒到檔案的開始時間，該檔案還不應該顯示
+                if current_datetime < file_first_timestamp:
+                    print(f"  ⏳ 檔案尚未開始播放 (開始時間點: {file_first_timestamp.strftime('%m-%d %H:%M')})")
+                    continue  # 跳過這個檔案
+                
+                # 檔案在有效播放期間內，選擇最合適的資料點
+                # 策略：選擇距離當前動畫時間最近的資料點（無論過去或未來）
+                selected_index, selected_timestamp = min(
+                    valid_timestamps_in_range, 
+                    key=lambda item: abs((item[1] - current_datetime).total_seconds())
+                )
+                
+                time_diff_hours = abs((selected_timestamp - current_datetime).total_seconds()) / 3600.0
+                print(f"  ✅ 選中時間點: {selected_timestamp.strftime('%m-%d %H:%M')} (距離 {time_diff_hours:.1f} 小時)")
+
+                # 把選定的資料來源記錄下來
+                if selected_timestamp not in sources_to_display:
+                    sources_to_display[selected_timestamp] = []
+
+                source_tuple = (filepath, selected_index)
+                if source_tuple not in sources_to_display[selected_timestamp]:
+                    sources_to_display[selected_timestamp].append(source_tuple)
+            else:
+                print(f"  ❌ 檔案在設定的UI時間範圍內沒有資料點")
+
+        # 3. 檢查我們是否找到了任何可以顯示的資料
+        if not sources_to_display:
+            # 如果在所有檔案中都找不到任何符合條件的資料，才清空畫面
+            self.flow_layer.dataProvider().truncate()
+            self.flow_layer.triggerRepaint()
             self.iface.mapCanvas().refresh()
+            print(f"在 {current_datetime} 及其之前，找不到任何在使用者範圍內的有效資料。")
+            return # 結束函式
+
+        # 4. 組合所有需要顯示的資料來源
+        all_sources = []
+        for timestamp, source_list in sorted(sources_to_display.items()):
+            all_sources.extend(source_list)
+            print(f"✅ 準備顯示時間點 {timestamp} 的資料，來源: {[os.path.basename(s[0]) for s in source_list]}")
+
+        # 將 all_sources 賦值給 sources 變數，以便後續程式碼可以繼續使用
+        sources = all_sources
+
+        # --- 新邏輯結束 ---
+        
+        # 檢查是否有資料來源可供顯示
+        if not sources:
+            print(f"❌ 警告: 沒有找到任何可顯示的資料來源")
+            self.flow_layer.dataProvider().truncate()
+            self.flow_layer.triggerRepaint()
+            self.iface.mapCanvas().refresh()
+            return
+
+        # ==================== 使用新的持續顯示邏輯進行智能資料合併顯示 ====================
+        # 顯示所有檔案的資料，但使用空間去重邏輯避免重疊
+        print(f"使用持續顯示邏輯 (目標時間 {current_datetime.strftime('%H:%M:%S')}) 有 {len(sources)} 個來源，使用智能合併顯示")
+        
+        all_features = []
+        source_filenames = []
+        
+        # 收集所有來源的原始資料
+        all_raw_features = []
+        
+        for filepath, index_in_file in sources:
+            if filepath in self.multi_reader.files:
+                reader = self.multi_reader.files[filepath]
+                source_filename = os.path.basename(filepath)
+                source_filenames.append(source_filename)
+
+                print(f"📊 正在從 {source_filename} 讀取資料 (索引: {index_in_file})")
+                # 從每個來源獲取特徵
+                features_from_source = self.get_features_for_source(reader, index_in_file, source_filename)
+                print(f"  -> 獲得 {len(features_from_source)} 個特徵")
+                all_raw_features.extend(features_from_source)
+            else:
+                print(f"❌ 檔案路徑 {filepath} 不在讀取器中")
+        
+        # 應用空間去重邏輯
+        all_features = self._merge_overlapping_features(all_raw_features)
+        print(f"原始特徵數: {len(all_raw_features)}, 合併後特徵數: {len(all_features)}")
+        # ==================== 核心修改結束 ====================
+
+        # 4. Update other UI feedback (time label already updated above)
+
+        if self.flow_layer:
+            display_name = ", ".join(source_filenames)
+            new_layer_name = f"S111 Flow (Source: {display_name})"
+            self.flow_layer.setName(new_layer_name)
+
+        if hasattr(self.dlg, 'fileListWidget'):
+            active_filepaths = [src_filepath for src_filepath, idx in sources]
+            for i in range(self.dlg.fileListWidget.count()):
+                item = self.dlg.fileListWidget.item(i)
+                if item and item.data(Qt.UserRole) in active_filepaths:
+                    item.setBackground(QColor(200, 255, 200)) # Highlight
+                elif item:
+                    item.setBackground(QColor(255, 255, 255, 0)) # No highlight
+
+        # 6. Update layer data in one go
+        provider = self.flow_layer.dataProvider()
+        provider.truncate() # Clear first
+        provider.addFeatures(all_features) # Add all features
+        self.flow_layer.updateExtents()
+        self.flow_layer.triggerRepaint()
+        self.iface.mapCanvas().refresh()
+        print(f"Layer updated with {len(all_features)} features from {len(sources)} source(s).")
+
+    def _merge_overlapping_features(self, all_raw_features):
+        """
+        智能合併重疊的特徵，避免同一位置顯示多個箭頭
+        
+        Args:
+            all_raw_features (list): 所有原始特徵列表
+            
+        Returns:
+            list: 合併後的特徵列表
+        """
+        if not all_raw_features:
+            return []
+            
+        # 使用空間索引進行去重，基於經緯度位置
+        merged_features = []
+        position_tolerance = 0.001  # 約100米的容忍度（度數）
+        
+        # 按位置分組特徵
+        position_groups = {}
+        
+        for feature in all_raw_features:
+            if feature.hasGeometry():
+                geom = feature.geometry()
+                if geom.type() == 0:  # Point geometry
+                    point = geom.asPoint()
+                    # 使用網格化位置作為鍵來分組鄰近特徵
+                    grid_x = round(point.x() / position_tolerance) * position_tolerance
+                    grid_y = round(point.y() / position_tolerance) * position_tolerance
+                    grid_key = (grid_x, grid_y)
+                    
+                    if grid_key not in position_groups:
+                        position_groups[grid_key] = []
+                    position_groups[grid_key].append(feature)
+        
+        # 對每個位置組進行智能合併
+        for grid_key, features_at_position in position_groups.items():
+            if len(features_at_position) == 1:
+                # 單一特徵，直接添加
+                merged_features.append(features_at_position[0])
+            else:
+                # 多個特徵重疊，選擇最佳代表
+                merged_feature = self._select_best_representative_feature(features_at_position)
+                merged_features.append(merged_feature)
+        
+        return merged_features
+    
+    def _select_best_representative_feature(self, overlapping_features):
+        """
+        從重疊特徵中選擇最佳代表特徵
+        
+        選擇策略：
+        1. 優先選擇速度最大的特徵（通常更重要）
+        2. 如果速度相近，優先選擇來自最新檔案的特徵
+        3. 在屬性中記錄合併資訊
+        
+        Args:
+            overlapping_features (list): 重疊位置的特徵列表
+            
+        Returns:
+            QgsFeature: 選定的代表特徵
+        """
+        if len(overlapping_features) == 1:
+            return overlapping_features[0]
+        
+        # 按速度降序排序，選擇最大速度的特徵
+        def get_speed(feature):
+            try:
+                return float(feature.attribute('speed') or 0)
+            except (ValueError, TypeError):
+                return 0
+        
+        # 排序：速度優先，然後按來源檔案名稱
+        sorted_features = sorted(overlapping_features, 
+                               key=lambda f: (-get_speed(f), f.attribute('source') or ''))
+        
+        best_feature = sorted_features[0]
+        
+        # 在屬性中添加合併資訊
+        source_list = []
+        speed_list = []
+        for feat in overlapping_features:
+            source = feat.attribute('source') or 'Unknown'
+            speed = get_speed(feat)
+            source_list.append(source)
+            speed_list.append(f"{speed:.2f}")
+        
+        # 更新最佳特徵的屬性以顯示合併資訊
+        best_feature.setAttribute('merged_sources', '; '.join(set(source_list)))
+        best_feature.setAttribute('all_speeds', ', '.join(speed_list))
+        best_feature.setAttribute('merged_count', len(overlapping_features))
+        
+        return best_feature
+
+    def get_features_for_source(self, reader, index_in_file, source_filename):
+        """
+        從指定的讀取器和檔案內索引提取特徵數據
+        
+        Args:
+            reader (S111Reader): 數據讀取器
+            index_in_file (int): 該讀取器中的時間索引
+            source_filename (str): 數據來源檔案名稱，用於屬性記錄
+            
+        Returns:
+            list: QgsFeature 對象列表
+        """
+        features = []
+        
+        # 驗證輸入參數
+        if not reader or index_in_file >= len(reader.surfaces):
+            print(f"錯誤: 無效的讀取器或索引 {index_in_file} 超出範圍 (最大: {len(reader.surfaces)-1 if reader else 'N/A'})")
+            return features
+            
+        # 獲取指定時間點的數據
+        surface_data = reader.surfaces[index_in_file]
+        
+        # 添加調試資訊來檢查數據結構
+        print(f"surface_data 類型: {type(surface_data)}")
+        print(f"surface_data 內容: {surface_data}")
+        if hasattr(surface_data, 'shape'):
+            print(f"surface_data 形狀: {surface_data.shape}")
+        if isinstance(surface_data, (list, tuple)):
+            print(f"surface_data 長度: {len(surface_data)}")
+            for i, item in enumerate(surface_data):
+                print(f"  項目 {i}: {type(item)}, 形狀: {getattr(item, 'shape', 'N/A')}")
+        
+        # 根據數據結構嘗試解包
+        speed = None
+        direction = None
+        
+        try:
+            if isinstance(surface_data, (list, tuple)):
+                if len(surface_data) >= 2:
+                    speed, direction = surface_data[0], surface_data[1]
+                    print("成功從 tuple/list 解包 speed 和 direction")
+                elif len(surface_data) == 1:
+                    print("警告: surface_data 只有一個元素，可能是組合數據")
+                    # 檢查是否是包含兩個通道的數據
+                    single_data = surface_data[0]
+                    if hasattr(single_data, 'shape') and len(single_data.shape) >= 3:
+                        print(f"嘗試從 3D 陣列解包，形狀: {single_data.shape}")
+                        if single_data.shape[-1] == 2 or single_data.shape[0] == 2:
+                            if single_data.shape[0] == 2:
+                                speed = single_data[0]
+                                direction = single_data[1]
+                            elif single_data.shape[-1] == 2:
+                                speed = single_data[..., 0]
+                                direction = single_data[..., 1]
+                            print("成功從 3D 陣列解包")
+                        else:
+                            print("警告: 3D 陣列不包含 2 個通道，使用同一數據作為 speed 和 direction")
+                            speed = single_data
+                            direction = single_data
+                    else:
+                        print("使用單一數據作為 speed 和 direction")
+                        speed = single_data
+                        direction = single_data
+                else:
+                    print("錯誤: surface_data 為空")
+                    return features
+            elif hasattr(surface_data, 'shape'):
+                # 直接的 numpy 陣列
+                if len(surface_data.shape) >= 3:
+                    print(f"嘗試從直接 3D 陣列解包，形狀: {surface_data.shape}")
+                    if surface_data.shape[-1] == 2:
+                        speed = surface_data[..., 0]
+                        direction = surface_data[..., 1]
+                        print("成功從直接 3D 陣列解包 (最後維度)")
+                    elif surface_data.shape[0] == 2:
+                        speed = surface_data[0]
+                        direction = surface_data[1]
+                        print("成功從直接 3D 陣列解包 (第一維度)")
+                    else:
+                        print("警告: 3D 陣列不包含 2 個通道，使用同一數據")
+                        speed = surface_data
+                        direction = surface_data
+                else:
+                    print("使用直接 2D 陣列作為 speed 和 direction")
+                    speed = surface_data
+                    direction = surface_data
+            else:
+                print(f"錯誤: 無法識別的 surface_data 結構")
+                return features
+                
+        except Exception as e:
+            print(f"解包 surface_data 時出錯: {e}")
+            print(f"surface_data 詳細信息: {surface_data}")
+            import traceback
+            print(traceback.format_exc())
+            return features
+            
+        # 檢查解包結果
+        if speed is None or direction is None:
+            print("錯誤: 無法獲取 speed 或 direction 數據")
+            return features
+            
+        print(f"解包成功 - Speed 形狀: {getattr(speed, 'shape', 'N/A')}, Direction 形狀: {getattr(direction, 'shape', 'N/A')}")
+            
+        geotransform = reader.geotransform
+        
+        # 設置備用地理參考信息
+        if not geotransform:
+            geotransform = [118.0, 0.01, 0, 22.0, 0, -0.01]  # 備用值
+        
+        # 根據數據格式處理不同類型的數據
+        if reader.data_format == 2:
+            # Type 2: 規則網格資料處理
+            print(f"處理 Type 2 (規則網格) 資料，數據形狀: {speed.shape}")
+            height, width = speed.shape
+            step = 1  # 可以根據需要調整採樣間隔以提高性能
+            
+            for y in range(0, height, step):
+                for x in range(0, width, step):
+                    try:
+                        s = float(speed[y, x])
+                        d = float(direction[y, x])
+                        
+                        # 檢查是否為有效數據
+                        if np.isnan(s) or np.isnan(d):
+                            continue
+                            
+                        # 使用 geotransform 計算地理座標
+                        lon = geotransform[0] + x * geotransform[1]
+                        lat = geotransform[3] + y * geotransform[5]
+                        
+                        # 創建特徵
+                        feature = QgsFeature(self.flow_layer.fields())
+                        feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
+                        
+                        # 設置屬性: [Longitude, Latitude, Speed, Direction, Source, merged_sources, all_speeds, merged_count]
+                        feature.setAttributes([lon, lat, s, d, source_filename, None, None, 1])
+                        features.append(feature)
+                        
+                    except Exception as e:
+                        print(f"處理 Type 2 數據點 ({x}, {y}) 時出錯: {e}")
+                        continue
         else:
-            print(f"錯誤: 時間索引 {value} 超出範圍 0-{len(current_reader.time_points)-1}")
+            # Type 3 或其他: 點集合資料處理
+            print(f"處理 Type 3 (點集合) 或其他格式資料，數據形狀: {speed.shape}")
+            
+            # 檢查是否為一維點集合數據
+            if len(speed.shape) == 1:
+                # Type 3 點集合：嘗試從 reader 中獲取地理座標
+                coordinates = self._get_positioning_data(reader)
+                
+                if coordinates is not None and len(coordinates) == len(speed):
+                    print(f"找到地理座標數據，處理 {len(speed)} 個點")
+                    for i in range(len(speed)):
+                        try:
+                            s = float(speed[i])
+                            d = float(direction[i])
+                            lon = float(coordinates[i][0])  # longitude
+                            lat = float(coordinates[i][1])  # latitude
+                            
+                            # 檢查是否為有效數據（跳過 -1 值）
+                            if s <= 0 or np.isnan(s) or np.isnan(d) or np.isnan(lon) or np.isnan(lat):
+                                continue
+                            
+                            # 創建特徵
+                            feature = QgsFeature(self.flow_layer.fields())
+                            feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
+                            
+                            # 設置屬性: [Longitude, Latitude, Speed, Direction, Source, merged_sources, all_speeds, merged_count]
+                            feature.setAttributes([lon, lat, s, d, source_filename, None, None, 1])
+                            features.append(feature)
+                            
+                        except Exception as e:
+                            print(f"處理 Type 3 數據點 {i} 時出錯: {e}")
+                            continue
+                else:
+                    print("警告: 無法找到地理座標數據或座標數量與數據點不匹配，使用 geotransform")
+                    # 回退到使用 geotransform 的方法（將一維數據視為一行）
+                    for i in range(len(speed)):
+                        try:
+                            s = float(speed[i])
+                            d = float(direction[i])
+                            
+                            # 檢查是否為有效數據
+                            if s <= 0 or np.isnan(s) or np.isnan(d):
+                                continue
+                                
+                            # 計算地理座標（將一維索引轉換為 x, y）
+                            lon = geotransform[0] + i * geotransform[1]
+                            lat = geotransform[3]  # 假設所有點在同一緯度
+                            
+                            # 創建特徵
+                            feature = QgsFeature(self.flow_layer.fields())
+                            feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
+                            
+                            # 設置屬性: [Longitude, Latitude, Speed, Direction, Source, merged_sources, all_speeds, merged_count]
+                            feature.setAttributes([lon, lat, s, d, source_filename, None, None, 1])
+                            features.append(feature)
+                            
+                        except Exception as e:
+                            print(f"處理 Type 3 數據點 {i} 時出錯: {e}")
+                            continue
+            else:
+                # 二維網格資料處理 (原有邏輯)
+                height, width = speed.shape
+                step = 1  # 可以根據需要調整採樣間隔以提高性能
+                
+                for y in range(0, height, step):
+                    for x in range(0, width, step):
+                        try:
+                            s = float(speed[y, x])
+                            d = float(direction[y, x])
+                            
+                            # 檢查是否為有效數據
+                            if np.isnan(s) or np.isnan(d):
+                                continue
+                                
+                            # 計算地理座標
+                            lon = geotransform[0] + x * geotransform[1]
+                            lat = geotransform[3] + y * geotransform[5]
+                            
+                            # 創建特徵
+                            feature = QgsFeature(self.flow_layer.fields())
+                            feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
+                            
+                            # 設置屬性: [Longitude, Latitude, Speed, Direction, Source, merged_sources, all_speeds, merged_count]
+                            feature.setAttributes([lon, lat, s, d, source_filename, None, None, 1])
+                            features.append(feature)
+                            
+                        except Exception as e:
+                            print(f"處理數據點 ({x}, {y}) 時出錯: {e}")
+                            continue
+                    
+        print(f"從來源 '{source_filename}' 的索引 {index_in_file} 提取了 {len(features)} 個特徵")
+        return features
+        
+    def _get_positioning_data(self, reader):
+        """
+        獲取地理座標數據 (從 reader 中已預先載入的座標)
+        
+        Args:
+            reader (S111Reader): 數據讀取器
+            
+        Returns:
+            numpy.ndarray: 座標陣列 [[lon1, lat1], [lon2, lat2], ...] 或 None
+        """
+        return reader.positioning_coordinates
+    def update_layer_data_with_reader(self, reader, time_index, source_filename=""):
+        """
+        使用指定的讀取器和時間索引更新圖層數據
+        
+        Args:
+            reader (S111Reader): 指定的數據讀取器
+            time_index (int): 該讀取器中的時間索引
+            source_filename (str): 數據來源檔案名稱，用於屬性記錄
+        """
+        if not self.flow_layer or not reader:
+            return
+            
+        # 使用新的 get_features_for_source 方法來提取特徵
+        features = self.get_features_for_source(reader, time_index, source_filename)
+        
+        # 清除舊特徵並添加新特徵
+        print(f"正在更新圖層，添加 {len(features)} 個特徵...")
+        provider = self.flow_layer.dataProvider()
+        provider.truncate()  # 清除所有現有特徵
+        provider.addFeatures(features)
+        self.flow_layer.updateExtents()
+        self.flow_layer.triggerRepaint()
+
+        print(f"圖層更新完成")
+
+    def update_layer_data(self, time_index):
+        """
+        舊版方法：使用當前讀取器更新圖層數據（為了向後兼容）
+        """
+        current_reader = self.multi_reader.get_current_reader()
+        if current_reader:
+            # 為向後兼容，使用當前檔案名作為來源
+            source_filename = ""
+            if self.multi_reader.current_file:
+                source_filename = os.path.basename(self.multi_reader.current_file)
+            self.update_layer_data_with_reader(current_reader, time_index, source_filename)
+
 
     def update_arrow_size(self, size):
         """更新箭頭大小（在S-111標準模式下此功能被標準化）"""
         print(f"update_arrow_size 被調用: 大小 = {size}")
         print("注意: 在S-111標準模式下，箭頭大小由速度值自動計算")
         
-        # 在S-111標準模式下，大小由速度自動決定，但可以作為縮放係數
-        # 重新創建向量圖層以應用可能的縮放
-        if hasattr(self.dlg, 'sliderTime'):
-            current_time = self.dlg.sliderTime.value()
-            if self.multi_reader and self.multi_reader.get_current_reader():
-                print(f"重新創建時間索引 {current_time} 的向量圖層")
-                self.create_vector_layer(current_time)
+        # 檢查固定圖層是否存在
+        if not self.flow_layer:
+            print("錯誤: 固定圖層不存在，無法更新箭頭大小")
+            return
+            
+        # 檢查圖層是否有效
+        if not self.flow_layer.isValid():
+            print("錯誤: 固定圖層無效，無法更新箭頭大小")
+            return
+            
+        try:
+            # 在S-111標準模式下，大小由速度自動決定，但可以作為縮放係數
+            # 重新應用符號系統到固定圖層
+            print("開始重新應用符號系統...")
+            self.apply_s111_standard_symbology(self.flow_layer)
+            
+            # 確保圖層可見
+            self.flow_layer.setOpacity(1.0)
+            
+            # 強制刷新圖層
+            self.flow_layer.triggerRepaint()
+            self.flow_layer.updateExtents()
+            
+            # 刷新地圖畫布
+            self.iface.mapCanvas().refresh()
+            
+            # 檢查圖層是否有特徵
+            feature_count = self.flow_layer.featureCount()
+            print(f"圖層特徵數量: {feature_count}")
+            
+            # 檢查渲染器是否正確設置
+            renderer = self.flow_layer.renderer()
+            if renderer:
+                print(f"渲染器類型: {type(renderer).__name__}")
+            else:
+                print("警告: 圖層沒有渲染器")
+                
+            print("已重新應用符號系統到固定圖層")
+            
+        except Exception as e:
+            print(f"更新箭頭大小時出錯: {e}")
+            print(traceback.format_exc())
+            
+            # 嘗試恢復圖層顯示
+            try:
+                # 重新載入當前時間點的數據
+                if hasattr(self.dlg, 'sliderTime'):
+                    current_time = self.dlg.sliderTime.value()
+                    print(f"嘗試重新載入時間索引 {current_time} 的數據")
+                    self.update_layer_data(current_time)
+            except Exception as recovery_error:
+                print(f"恢復圖層顯示時出錯: {recovery_error}")
+
+    def refresh_layer_display(self):
+        """刷新圖層顯示，用於解決箭頭消失的問題"""
+        print("刷新圖層顯示...")
+        
+        if not self.flow_layer:
+            print("錯誤: 固定圖層不存在")
+            return
+            
+        try:
+            # 重新載入當前篩選後時間點的數據
+            if hasattr(self.dlg, 'sliderTime'):
+                current_slider_index = self.dlg.sliderTime.value()
+                print(f"刷新顯示，當前篩選後索引: {current_slider_index}")
+                # 直接調用 update_time_display，它會處理所有事情
+                self.update_time_display(current_slider_index)
+                
+                # 重新應用符號系統
+                print("重新應用符號系統...")
+                self.apply_s111_standard_symbology(self.flow_layer)
+                
+                # 確保圖層可見
+                self.flow_layer.setOpacity(1.0)
+                
+                # 強制刷新
+                self.flow_layer.triggerRepaint()
+                self.flow_layer.updateExtents()
+                self.iface.mapCanvas().refresh()
+                
+                print("圖層顯示已刷新")
+                
+        except Exception as e:
+            print(f"刷新圖層顯示時出錯: {e}")
+            print(traceback.format_exc())
 
     def run(self):
         """Run method that performs all the real work"""
@@ -1597,7 +2670,7 @@ class S111Viewer:
                 # 連接按鈕信號
                 print("連接界面按鈕...")
                 if hasattr(self.dlg, 'btnBrowse'):
-                    self.dlg.btnBrowse.clicked.connect(self.select_files)  # 改為多檔案選擇
+                    self.dlg.btnBrowse.clicked.connect(self.select_files)
                     print("已連接瀏覽按鈕（多檔案模式）")
                 else:
                     print("警告: 找不到 btnBrowse 按鈕")
@@ -1619,6 +2692,22 @@ class S111Viewer:
                     print("已連接停止按鈕")
                 else:
                     print("警告: 找不到 btnStop 按鈕")
+                
+                # --- NEW: Connect signals for the new QDateTimeEdit widgets ---
+                if hasattr(self.dlg, 'dtStartTime') and hasattr(self.dlg, 'dtEndTime'):
+                    # Trigger the update_time_range function when the user changes the time
+                    self.dlg.dtStartTime.dateTimeChanged.connect(self.update_time_range)
+                    self.dlg.dtEndTime.dateTimeChanged.connect(self.update_time_range)
+                    print("已連接開始/結束時間選擇器")
+                else:
+                    print("警告: 找不到 dtStartTime 或 dtEndTime 元件")
+                    
+                # --- Connect animation interval dropdown ---
+                if hasattr(self.dlg, 'comboBox'):
+                    self.dlg.comboBox.currentTextChanged.connect(self.update_time_range)
+                    print("已連接動畫間隔選擇器 (comboBox)")
+                else:
+                    print("警告: 找不到 comboBox 元件")
                     
                 if hasattr(self.dlg, 'sliderTime'):
                     self.dlg.sliderTime.valueChanged.connect(self.update_time_display)
@@ -1646,9 +2735,5 @@ class S111Viewer:
 
     def remove_old_layers(self):
         """移除本插件加進來的所有圖層"""
-        project = QgsProject.instance()
-        for layer_id in self.layers:
-            layer = project.mapLayer(layer_id)
-            if layer:
-                project.removeMapLayer(layer)
-        self.layers = []
+        # 現在只需要移除固定圖層
+        self.clear_layers()

@@ -4,11 +4,11 @@
 [general]
 name=S-111 Viewer
 qgisMinimumVersion=3.0
-description=S-111 海洋數據可視化與動畫插件
+description=Professional S-111 marine surface current data visualization and animation plugin
 version=0.1
 author=NTOU
 email=steven65026502@gmail.com
-about=S-111 海流數據可視化與動畫插件
+about=A comprehensive QGIS plugin for visualizing and animating marine surface current data following the IHO S-111 international standard. Features multi-file management, time series animation, standardized symbology with 9 speed bands, automatic HDF5 file analysis, and dependency checking tools. Perfect for oceanographers, marine researchers, and hydrographic offices working with ocean current data. Supports batch processing of multiple S-111 files with smooth temporal visualization and professional-grade current vector display following international maritime standards.
 tracker=https://github.com/steven65026502/QGIS-S111-Viewer/issues
 repository=https://github.com/steven65026502/QGIS-S111-Viewer
 # End of mandatory metadata
@@ -16,10 +16,20 @@ repository=https://github.com/steven65026502/QGIS-S111-Viewer
 # Recommended items:
 hasProcessingProvider=no
 # Uncomment the following line and add your changelog:
-# changelog=
+changelog=v0.1 (2025-05-16)
+    * Initial release with S-111 standard compliance
+    * Multi-file management for batch processing
+    * Time series animation with smooth playback controls
+    * Standardized symbology with 9 IHO-compliant speed bands
+    * Automatic HDF5 file structure analysis and parsing
+    * Built-in dependency checking and installation guidance
+    * Professional current vector visualization
+    * Cross-platform compatibility (Windows/Linux/macOS)
+    * Comprehensive error logging and debugging tools
+    * Bilingual support (English/Chinese)
 
 # Tags are comma separated with spaces allowed
-tags=python
+tags=ocean,marine,current,s111,s-111,oceanography,hdf5,animation,visualization,maritime,navigation,hydrography,iho,standard,surface current,time series,vector field
 
 homepage=https://github.com/steven65026502/QGIS-S111-Viewer
 category=Plugins
@@ -35,7 +45,7 @@ deprecated=False
 # Check the documentation for more information.
 # plugin_dependencies=
 
-Category of the plugin: Raster, Vector, Database or Web
+# Category of the plugin: Raster, Vector, Database or Web
 # category=
 
 # If the plugin can run on QGIS Server.
