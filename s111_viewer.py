@@ -22,6 +22,7 @@
  * *
  ***************************************************************************/
 """
+import json
 import os
 import sys
 import traceback
@@ -40,7 +41,8 @@ from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, Qt, QTime
 from qgis.core import (
     QgsProject, QgsVectorLayer, QgsFeature, QgsGeometry, 
     QgsPointXY, QgsField, QgsSingleSymbolRenderer, QgsSymbol,
-    QgsMarkerSymbol, QgsProperty, QgsArrowSymbolLayer, QgsRuleBasedRenderer, QgsLineSymbol, QgsLineString, QgsPoint, QgsFields, QgsSymbolLayer, QgsSvgMarkerSymbolLayer, QgsUnitTypes
+    QgsMarkerSymbol, QgsProperty, QgsArrowSymbolLayer, QgsRuleBasedRenderer, QgsLineSymbol, QgsLineString, QgsPoint, QgsFields, QgsSymbolLayer, QgsSvgMarkerSymbolLayer, QgsUnitTypes, QgsSimpleMarkerSymbolLayer,
+    QgsGraduatedSymbolRenderer, QgsRendererRange
 )
 from qgis.PyQt.QtGui import QIcon, QColor
 from qgis.PyQt.QtWidgets import (QAction, QFileDialog, QMessageBox, QColorDialog, 
@@ -55,6 +57,18 @@ from .resources import *
 import os.path
 import numpy as np
 import math
+
+HOTSPOT_WARN_KN = 0.5
+HOTSPOT_CRITICAL_KN = 1.0
+DIR_HOTSPOT_WARN_DEG = 30.0
+DIR_HOTSPOT_CRITICAL_DEG = 45.0
+# Use the two most severe colors from the S-111 speed-band palette
+# for hotspot outlines so the visual language matches the original arrows.
+HOTSPOT_WARNING_COLOR = '#FFD700'   # Yellow outline for warning hotspots
+HOTSPOT_CRITICAL_COLOR = '#FF0000'  # Red outline for critical hotspots
+DIR_HOTSPOT_WARNING_COLOR = '#4FC3F7'
+DIR_HOTSPOT_CRITICAL_COLOR = '#1565C0'
+PERCENTILE_ORANGE_COLOR = '#FF8C00'
 
 # 嘗試導入 h5py，帶詳細錯誤報告
 try:
@@ -76,11 +90,13 @@ except Exception as e:
 class S111Standards:
     """S-111 標準規範類"""
     
-    # 箭頭大小計算參數 (根據 S-111 標準 Table 9-3)
-    HREF = 10.0  # 參考高度 (mm)
-    SREF = 5.0   # 參考速度 (kn)
-    SLOW = 2.0   # 最小速度 (kn)
-    SHIGH = 13.0 # 最大速度 (kn)
+    # 箭頭大小計算參數 (根據新版 XSLT 規範的縮放因子邏輯)
+    SCALE_FLOOR = 0.40          # 最小縮放因子 (速度 0.0-2.0 節)
+    SCALE_FACTOR_INTERMEDIATE = 0.20  # 中間縮放因子 (速度 2.0-13.0 節時的線性係數)
+    SCALE_CEILING = 2.60        # 最大縮放因子 (速度 >= 13.0 節)
+    SLOW = 2.0                  # 最小速度閾值 (kn)
+    SHIGH = 13.0                # 最大速度閾值 (kn)
+    BASE_SIZE_MM = 10.0         # 基礎大小 (mm) - 用於將縮放因子轉換為實際大小
     
     # 速度帶顏色方案 (根據 S-111 標準 Table 9-2 - 日間顯示顏色)
     # 使用官方規範的 RGB 顏色值
@@ -110,13 +126,25 @@ class S111Standards:
     
     @staticmethod
     def calculate_arrow_size_mm(speed_kn):
-        """根據 S-111 標準計算箭頭大小 (mm)"""
+        """根據新版 XSLT 規範計算箭頭大小 (mm)
+        
+        縮放因子邏輯：
+        - 速度 0.0 ~ 2.0 節 (Band 1-3): 固定為 0.40 縮放因子
+        - 速度 2.0 ~ 13.0 節 (Band 4-8): 線性增加 (速度 * 0.20)
+        - 速度 >= 13.0 節 (Band 9): 固定為 2.60 縮放因子
+        """
         if speed_kn <= S111Standards.SLOW:
-            return S111Standards.HREF * (speed_kn / S111Standards.SLOW)
+            # Band 1-3: 固定最小縮放因子
+            scale_factor = S111Standards.SCALE_FLOOR
         elif speed_kn >= S111Standards.SHIGH:
-            return S111Standards.HREF * (speed_kn / S111Standards.SREF)
+            # Band 9: 固定最大縮放因子
+            scale_factor = S111Standards.SCALE_CEILING
         else:
-            return S111Standards.HREF
+            # Band 4-8: 線性增加 (速度 * 0.20)
+            scale_factor = speed_kn * S111Standards.SCALE_FACTOR_INTERMEDIATE
+        
+        # 將縮放因子轉換為實際毫米大小
+        return S111Standards.BASE_SIZE_MM * scale_factor
     
     @staticmethod
     def mm_to_map_units(mm_size, scale_factor=0.5):
@@ -353,6 +381,7 @@ class S111Reader:
         self.geotransform = None  # 地理參考信息
         self.data_format = None  # 數據編碼格式 (2 = Type 2, 3 = Type 3)
         self.positioning_coordinates = None  # Type 3 點集合的地理座標
+        self.issue_date = None  # 檔案發布日期 (datetime)，用於多檔案重疊時擇優
         
     def read_file(self, filename):
         """讀取 S-111 HDF5 文件
@@ -411,7 +440,11 @@ class S111Reader:
                     except:
                         pass
                 self.metadata[attr_name] = attr_value
-            
+
+            # 解析 Issue Date (發布日期) — 用於多檔案重疊時擇優
+            self.issue_date = self._parse_issue_date(f)
+            print(f"  Issue Date: {self.issue_date}")
+
             # 讀取數據編碼格式
             data_format_found = False
             if 'dataCodingFormat' in f.attrs:
@@ -506,16 +539,31 @@ class S111Reader:
             if 'surfaceCurrentSpeed' in current_group and 'surfaceCurrentDirection' in current_group:
                 print("在 SurfaceCurrent 根組中直接找到數據")
                 try:
-                    speed = current_group['surfaceCurrentSpeed'][()]
-                    direction = current_group['surfaceCurrentDirection'][()]
-                    # 將數據上下翻轉
-                    speed_flipped = np.flipud(speed)
-                    direction_flipped = np.flipud(direction)
+                    # 讀取原始資料
+                    raw_speed = current_group['surfaceCurrentSpeed'][()]
+                    raw_direction = current_group['surfaceCurrentDirection'][()]
+
+                    # 檢查是否有 Geometry (幾何定義)
+                    has_geometry = ('geometry' in current_group.keys()) or \
+                                   ('geometry' in file_obj.keys())
+
+                    if has_geometry:
+                        # 【情況 A：有 Geometry】(不規則網格/Type 3 點集合)
+                        # 測試結果：數據順序是顛倒的，最後一個值對應第一個座標點 -> 翻轉數據順序！
+                        print("偵測到 Geometry 結構 (Type 3) -> 翻轉數據順序 (Reverse Order)")
+                        speed = np.flip(raw_speed)
+                        direction = np.flip(raw_direction)
+                    else:
+                        # 【情況 B：無 Geometry (規則網格/Type 2)】
+                        # 測試結果：這些檔案上下顛倒 -> 強制上下翻轉！
+                        print("偵測到規則網格 (Regular Grid/Type 2) -> 強制上下翻轉 (Flip UD)")
+                        speed = np.flipud(raw_speed)
+                        direction = np.flipud(raw_direction)
+
                     # 如果找不到時間數據，使用當前索引創建假的 datetime
                     default_time = datetime.datetime(2000, 1, 1) + datetime.timedelta(seconds=len(self.time_points))
                     self.time_points.append(default_time)
-                    self.surfaces.append((speed_flipped, direction_flipped))
-                    print(f"已讀取單個時間點的數據，速度形狀: {speed.shape}（已上下翻轉）")
+                    self.surfaces.append((speed, direction))
                 except Exception as e:
                     print(f"讀取直接數據時出錯: {e}")
             return
@@ -580,11 +628,38 @@ class S111Reader:
                 if 'values' in group:
                     values = group['values'][()]
                     print(f"找到 values 數據集，類型: {values.dtype}")
-                    
-                    if 'surfaceCurrentSpeed' in values.dtype.names and 'surfaceCurrentDirection' in values.dtype.names:
-                        speed = values['surfaceCurrentSpeed']
-                        direction = values['surfaceCurrentDirection']
-                        print(f"從 values 數據集讀取流速和方向數據，形狀: {speed.shape}")
+
+                    # 打印所有可用的欄位名稱
+                    if hasattr(values.dtype, 'names') and values.dtype.names:
+                        print(f"Values 數據集包含的欄位: {values.dtype.names}")
+
+                        # 檢查並讀取流速和方向欄位
+                        if 'surfaceCurrentSpeed' in values.dtype.names and 'surfaceCurrentDirection' in values.dtype.names:
+                            speed = values['surfaceCurrentSpeed']
+                            direction = values['surfaceCurrentDirection']
+
+                            # 驗證數據範圍，確保讀取的是流速/方向而非經緯度
+                            speed_min, speed_max = np.nanmin(speed), np.nanmax(speed)
+                            dir_min, dir_max = np.nanmin(direction), np.nanmax(direction)
+
+                            print(f"從 values 數據集讀取流速和方向數據")
+                            print(f"  - 流速形狀: {speed.shape}, 範圍: [{speed_min:.4f}, {speed_max:.4f}]")
+                            print(f"  - 方向形狀: {direction.shape}, 範圍: [{dir_min:.4f}, {dir_max:.4f}]")
+
+                            # 檢查數值範圍是否合理（流速通常 0-10 m/s，方向 0-360 度）
+                            if speed_max > 50 or speed_min < -10:
+                                print(f"  ⚠ 警告：流速範圍異常 [{speed_min:.2f}, {speed_max:.2f}]，可能讀取了錯誤的欄位（經度？）")
+                            if dir_max > 360 or dir_min < -180:
+                                print(f"  ⚠ 警告：方向範圍異常 [{dir_min:.2f}, {dir_max:.2f}]，可能讀取了錯誤的欄位")
+
+                            # 檢查是否也有經緯度欄位（用於調試）
+                            if 'longitude' in values.dtype.names and 'latitude' in values.dtype.names:
+                                lons = values['longitude']
+                                lats = values['latitude']
+                                lon_min, lon_max = np.nanmin(lons), np.nanmax(lons)
+                                lat_min, lat_max = np.nanmin(lats), np.nanmax(lats)
+                                print(f"  - Values 中也包含經緯度: lon範圍[{lon_min:.4f}, {lon_max:.4f}], lat範圍[{lat_min:.4f}, {lat_max:.4f}]")
+                                print(f"  ℹ 注意：經緯度應該從 geometryValues 讀取，不是從這裡")
                 else:
                     # 嘗試單獨讀取速度和方向數據集
                     for speed_field in ['surfaceCurrentSpeed', 'currentSpeed', 'speed', 'Speed']:
@@ -600,12 +675,27 @@ class S111Reader:
                             break
                 
                 if speed is not None and direction is not None:
-                    speed_flipped = np.flipud(speed)
-                    direction_flipped = np.flipud(direction)
+                    # 檢查是否有 Geometry (幾何定義)
+                    has_geometry = ('geometry' in group.parent.keys()) or \
+                                   ('geometry' in file_obj.keys())
+
+                    if has_geometry:
+                        # 【情況 A：有 Geometry】(不規則網格/Type 3 點集合)
+                        # 測試結果：數據順序是顛倒的，最後一個值對應第一個座標點 -> 翻轉數據順序！
+                        print("偵測到 Geometry 結構 (Type 3) -> 翻轉數據順序 (Reverse Order)")
+                        speed_fixed = np.flip(speed)
+                        direction_fixed = np.flip(direction)
+                    else:
+                        # 【情況 B：無 Geometry (規則網格/Type 2)】
+                        # 測試結果：這些檔案上下顛倒 -> 強制上下翻轉！
+                        print("偵測到規則網格 (Regular Grid/Type 2) -> 強制上下翻轉 (Flip UD)")
+                        speed_fixed = np.flipud(speed)
+                        direction_fixed = np.flipud(direction)
+
                     # 存儲 datetime 對象到 time_points
                     self.time_points.append(datetime_obj)
-                    self.surfaces.append((speed_flipped, direction_flipped))
-                    print(f"成功讀取時間點 {datetime_obj} 的數據（已上下翻轉）")
+                    self.surfaces.append((speed_fixed, direction_fixed))
+                    print(f"成功讀取時間點 {datetime_obj} 的數據")
                 else:
                     print(f"組 {group_name} 中未找到有效的速度或方向數據")
                     
@@ -665,14 +755,31 @@ class S111Reader:
                 
                 if speed_dataset.shape == dir_dataset.shape:
                     print(f"使用數據集: {speed_path} 和 {dir_path}")
-                    # 將數據上下翻轉以修正方向問題
-                    speed_data = np.flipud(speed_dataset[()])
-                    direction_data = np.flipud(dir_dataset[()])
+
+                    # 讀取原始資料
+                    raw_speed = speed_dataset[()]
+                    raw_direction = dir_dataset[()]
+
+                    # 檢查是否有 Geometry (幾何定義)
+                    has_geometry = 'geometry' in file_obj.keys()
+
+                    if has_geometry:
+                        # 【情況 A：有 Geometry】(不規則網格/Type 3 點集合)
+                        # 測試結果：數據順序是顛倒的，最後一個值對應第一個座標點 -> 翻轉數據順序！
+                        print("偵測到 Geometry 結構 (Type 3) -> 翻轉數據順序 (Reverse Order)")
+                        speed_data = np.flip(raw_speed)
+                        direction_data = np.flip(raw_direction)
+                    else:
+                        # 【情況 B：無 Geometry (規則網格/Type 2)】
+                        print("偵測到規則網格 (Regular Grid/Type 2) -> 強制上下翻轉 (Flip UD)")
+                        speed_data = np.flipud(raw_speed)
+                        direction_data = np.flipud(raw_direction)
+
                     # 使用默認的 datetime 對象
                     default_time = datetime.datetime(2000, 1, 1) + datetime.timedelta(seconds=len(self.time_points))
                     self.time_points.append(default_time)
                     self.surfaces.append((speed_data, direction_data))
-                    print(f"成功讀取單個時間點的數據，形狀: {speed_dataset.shape}（已上下翻轉）")
+                    print(f"成功讀取單個時間點的數據，形狀: {speed_dataset.shape}")
 
                     
             # 複雜情況：多個數據集
@@ -690,14 +797,31 @@ class S111Reader:
                         # 如果在同一組中或路徑非常相似
                         if speed_parts[:-1] == dir_parts[:-1] or speed_path.split('/')[0] == dir_path.split('/')[0]:
                             print(f"根據路徑相似性匹配數據集: {speed_path} 和 {dir_path}")
-                            # 將數據上下翻轉以修正方向問題
-                            speed_data = np.flipud(speed_dataset[()])
-                            direction_data = np.flipud(dir_dataset[()])
+
+                            # 讀取原始資料
+                            raw_speed = speed_dataset[()]
+                            raw_direction = dir_dataset[()]
+
+                            # 檢查是否有 Geometry (幾何定義)
+                            has_geometry = 'geometry' in file_obj.keys()
+
+                            if has_geometry:
+                                # 【情況 A：有 Geometry】(不規則網格/Type 3 點集合)
+                                # 測試結果：數據順序是顛倒的，最後一個值對應第一個座標點 -> 翻轉數據順序！
+                                print("偵測到 Geometry 結構 (Type 3) -> 翻轉數據順序 (Reverse Order)")
+                                speed_data = np.flip(raw_speed)
+                                direction_data = np.flip(raw_direction)
+                            else:
+                                # 【情況 B：無 Geometry (規則網格/Type 2)】
+                                print("偵測到規則網格 (Regular Grid/Type 2) -> 強制上下翻轉 (Flip UD)")
+                                speed_data = np.flipud(raw_speed)
+                                direction_data = np.flipud(raw_direction)
+
                             # 使用默認的 datetime 對象
                             default_time = datetime.datetime(2000, 1, 1) + datetime.timedelta(seconds=len(self.time_points))
                             self.time_points.append(default_time)
                             self.surfaces.append((speed_data, direction_data))
-                            print(f"成功讀取數據，形狀: {speed_dataset.shape}（已上下翻轉）")
+                            print(f"成功讀取數據，形狀: {speed_dataset.shape}")
 
     def _set_geotransform(self, file_obj):
         """設置地理參考信息"""
@@ -764,25 +888,52 @@ class S111Reader:
                     
                     if 'east' in geo_values and 'west' in geo_values and 'xres' not in geo_values:
                         x_span = float(geo_values['east']) - float(geo_values['west'])
-                        geo_values['xres'] = x_span / width
+                        # 節點式網格：N 個節點之間有 N-1 個間距
+                        geo_values['xres'] = x_span / max(width - 1, 1)
                     elif 'xres' not in geo_values:
                         geo_values['xres'] = 0.01  # 默認經度分辨率
-                        
+
                     if 'north' in geo_values and 'south' in geo_values and 'yres' not in geo_values:
                         y_span = float(geo_values['north']) - float(geo_values['south'])
-                        geo_values['yres'] = y_span / height
+                        # 節點式網格：H 個節點之間有 H-1 個間距
+                        geo_values['yres'] = y_span / max(height - 1, 1)
                     elif 'yres' not in geo_values:
                         geo_values['yres'] = 0.01  # 默認緯度分辨率
             
             # 設置地理變換信息
             if len(geo_values) >= 4 and all(k in geo_values for k in required_keys):
+                west = float(geo_values.get('west', 0))
+                xres = float(geo_values.get('xres', 1))
+                yres = abs(float(geo_values.get('yres', 1)))
+                north_bound = float(geo_values.get('north', 0))
+
+                # [修正] S-111 的 northBoundLatitude 是網格外邊界，
+                # 不是最北端節點的中心。需要用 south + (H-1)*yres 計算
+                # 實際最北端節點位置，避免所有點往北偏移一個 yres。
+                if 'south' in geo_values and self.surfaces:
+                    south_bound = float(geo_values['south'])
+                    # 取得 grid height
+                    spd_data = self.surfaces[0]
+                    if isinstance(spd_data, (list, tuple)):
+                        spd_arr = spd_data[0]
+                    else:
+                        spd_arr = spd_data
+                    if hasattr(spd_arr, 'shape') and len(spd_arr.shape) >= 2:
+                        grid_height = spd_arr.shape[0]
+                        actual_north = south_bound + (grid_height - 1) * yres
+                        if abs(actual_north - north_bound) > 1e-9:
+                            print(f"[GeoTransform 修正] northBound={north_bound:.6f} → "
+                                  f"actual_north={actual_north:.6f} "
+                                  f"(south={south_bound:.6f} + ({grid_height}-1)*{yres:.6f})")
+                            north_bound = actual_north
+
                 self.geotransform = [
-                    float(geo_values.get('west', 0)),
-                    float(geo_values.get('xres', 1)),
+                    west,
+                    xres,
                     0,
-                    float(geo_values.get('north', 0)),
+                    north_bound,
                     0,
-                    -abs(float(geo_values.get('yres', 1)))  # 確保是負值
+                    -yres  # 確保是負值
                 ]
                 print(f"成功設置地理參考信息: {self.geotransform}")
             else:
@@ -885,9 +1036,9 @@ class S111Reader:
             
         text = "S-111 文件元數據:\n\n"
         
-        # 添加關鍵元數據
+        # 添加關鍵元數據 (移除錯誤的 issueDate/issueTime)
         important_keys = [
-            'productSpecification', 'issueDate', 'issueTime',
+            'productSpecification','correct_issue_date','correct_issue_time',
             'horizontalDatumReference', 'epoch', 'geographicIdentifier',
             'metadata', 'dataCoverage', 'dataType'
         ]
@@ -900,9 +1051,10 @@ class S111Reader:
                     value = value.decode('utf-8', errors='ignore')
                 text += f"{key}: {value}\n"
         
-        # 添加其他元數據
+        # 添加其他元數據 (排除錯誤的時間欄位)
+        excluded_keys = important_keys + ['issueDate', 'issueTime']
         for key, value in self.metadata.items():
-            if key not in important_keys:
+            if key not in excluded_keys:
                 if isinstance(value, bytes):
                     value = value.decode('utf-8', errors='ignore')
                 text += f"{key}: {value}\n"
@@ -912,8 +1064,61 @@ class S111Reader:
             text += f"\n時間序列: {len(self.time_points)} 個時間點\n"
             text += f"起始時間: {self.time_points[0]}\n"
             text += f"結束時間: {self.time_points[-1]}\n"
+            
+            # 添加基於實際資料時間的正確發布時間
+            try:
+                from datetime import datetime
+                start_time = datetime.fromisoformat(str(self.time_points[0]).replace('Z', '+00:00'))
+                # 使用資料開始時間作為正確的發布日期
+                correct_issue_date = start_time.strftime("%Y%m%d")
+                correct_issue_time = start_time.strftime("%H%M%SZ")
+            except Exception:
+                pass
         
         return text
+
+    def _parse_issue_date(self, hdf5_file):
+        """從 S-111 HDF5 Root Attributes 解析 Issue Date"""
+        import datetime as _dt
+
+        # 嘗試組合 issueDate + issueTime
+        date_val = hdf5_file.attrs.get('issueDate', None)
+        time_val = hdf5_file.attrs.get('issueTime', None)
+        if date_val is not None:
+            if isinstance(date_val, bytes):
+                date_val = date_val.decode('utf-8', errors='replace')
+            if isinstance(time_val, bytes):
+                time_val = time_val.decode('utf-8', errors='replace')
+            combined = f"{date_val}T{time_val or '00:00:00'}".rstrip('Z').strip()
+            for fmt in ['%Y-%m-%dT%H:%M:%S', '%Y%m%dT%H%M%S',
+                        '%Y-%m-%dT%H:%M', '%Y%m%dT%H%M']:
+                try:
+                    return _dt.datetime.strptime(combined, fmt)
+                except ValueError:
+                    continue
+
+        # 嘗試其他單一屬性
+        for attr_name in ['sourceDate', 'dateOfIssue', 'dateTimeOfIssue']:
+            if attr_name in hdf5_file.attrs:
+                val = hdf5_file.attrs[attr_name]
+                if isinstance(val, bytes):
+                    val = val.decode('utf-8', errors='replace')
+                if isinstance(val, str):
+                    clean = val.rstrip('Z').strip()
+                    for fmt in ['%Y-%m-%dT%H:%M:%S', '%Y%m%dT%H%M%SZ',
+                                '%Y-%m-%d', '%Y%m%d']:
+                        try:
+                            return _dt.datetime.strptime(clean, fmt)
+                        except ValueError:
+                            continue
+
+        # Fallback: 使用檔案修改時間
+        import os
+        if self.filename and os.path.exists(self.filename):
+            mtime = os.path.getmtime(self.filename)
+            return _dt.datetime.fromtimestamp(mtime)
+
+        return _dt.datetime(2000, 1, 1)  # 最後手段
 
 # 導入 S111ViewerDialog 類
 try:
@@ -954,20 +1159,48 @@ def _load_positioning_coordinates(self, file_obj):
                 if self._path_exists_in_hdf5(file_obj, path):
                     geometry_values = file_obj[path][()]
                     print(f"從 {path} 讀取地理座標，形狀: {geometry_values.shape}")
-                    
+
                     # 檢查數據結構
                     if hasattr(geometry_values, 'dtype') and geometry_values.dtype.names:
-                        # 結構化陣列，包含 longitude 和 latitude 欄位
+                        # 結構化陣列，打印所有欄位名稱
+                        print(f"geometryValues 包含的欄位: {geometry_values.dtype.names}")
+
+                        # 確保包含 longitude 和 latitude 欄位
                         if 'longitude' in geometry_values.dtype.names and 'latitude' in geometry_values.dtype.names:
                             lons = geometry_values['longitude']
                             lats = geometry_values['latitude']
-                            self.positioning_coordinates = np.column_stack((lons, lats))
-                            print(f"成功讀取並存儲 {len(self.positioning_coordinates)} 個座標點")
-                            return
+
+                            # 驗證數據範圍，確保讀取的是經緯度而非其他數據
+                            lon_min, lon_max = np.nanmin(lons), np.nanmax(lons)
+                            lat_min, lat_max = np.nanmin(lats), np.nanmax(lats)
+                            print(f"經度範圍: [{lon_min:.4f}, {lon_max:.4f}]")
+                            print(f"緯度範圍: [{lat_min:.4f}, {lat_max:.4f}]")
+
+                            # 檢查範圍是否合理（經度 -180~180，緯度 -90~90）
+                            if -180 <= lon_min <= 180 and -180 <= lon_max <= 180 and \
+                               -90 <= lat_min <= 90 and -90 <= lat_max <= 90:
+                                self.positioning_coordinates = np.column_stack((lons, lats))
+
+                                # 【重要】由於 Type 3 的 speed/direction 數據順序是顛倒的，
+                                # 我們也需要翻轉座標順序以保持一致
+                                print(f"✓ 原始讀取 {len(self.positioning_coordinates)} 個座標點")
+                                print(f"  翻轉座標順序以匹配數據...")
+                                self.positioning_coordinates = np.flip(self.positioning_coordinates, axis=0)
+                                print(f"  座標已翻轉：首點座標 ({self.positioning_coordinates[0][0]:.4f}, {self.positioning_coordinates[0][1]:.4f})")
+                                return
+                            else:
+                                print(f"⚠ 警告：經緯度範圍異常，可能讀取了錯誤的欄位")
+                                continue
                     elif len(geometry_values.shape) == 2 and geometry_values.shape[1] == 2:
                         # 直接的二維陣列 [longitude, latitude]
                         self.positioning_coordinates = geometry_values
-                        print(f"成功讀取並存儲 {len(self.positioning_coordinates)} 個座標點")
+
+                        # 【重要】由於 Type 3 的 speed/direction 數據順序是顛倒的，
+                        # 我們也需要翻轉座標順序以保持一致
+                        print(f"✓ 原始讀取 {len(self.positioning_coordinates)} 個座標點")
+                        print(f"  翻轉座標順序以匹配數據...")
+                        self.positioning_coordinates = np.flip(self.positioning_coordinates, axis=0)
+                        print(f"  座標已翻轉：首點座標 ({self.positioning_coordinates[0][0]:.4f}, {self.positioning_coordinates[0][1]:.4f})")
                         return
                         
             except Exception as e:
@@ -1043,6 +1276,30 @@ class S111Viewer:
         # --- NEW: Added a list to store the filtered timeline ---
         self.master_timeline = []
         
+        # Quality Monitoring (QM) variables
+        self.comparison_reader = None  # To store the S111Reader for the comparison file
+        self.comparison_layer = None          # 紅色：嚴重異常 (Diff_Val >= 1.0 kn)
+        self.comparison_layer_warning = None  # 黃色：輕微異常 (0.5 <= Diff_Val < 1.0 kn)
+        self.diff_vector_layer = None  # 預報誤差向量圖層
+
+        # Uncertainty Assessment (四天驗證) variables
+        self.uncertainty_readers = {}        # {offset_days: S111Reader}, e.g. {1: reader_d-1, ...}
+        self.uncertainty_hotspot_layers = {}  # {(offset, severity): QgsVectorLayer}
+        self._flow_raw_cache = None
+        self._hotspot_raw_cache = {}
+        self._comparison_raw_cache = None
+        self._scale_change_timer = None
+        self._scale_signal_connected = False
+
+        # ========================================
+        # S-102/S-104 Dynamic Bathymetry (獨立功能，不影響 S-111)
+        # ========================================
+        self.bathymetry_manager = None      # S-102/S-104 管理器
+        self.bathymetry_layer = None        # 水深柵格圖層（獨立於 flow_layer）
+        self.s102_filepath = None           # S-102 檔案路徑
+        self.s104_filepath = None           # S-104 檔案路徑
+        self._bathymetry_tiff_path = None   # GeoTIFF 路徑（用於無閃爍更新）
+
         # 創建日志目錄
         self.log_dir = os.path.join(self.plugin_dir, 'logs')
         if not os.path.exists(self.log_dir):
@@ -1121,15 +1378,81 @@ class S111Viewer:
                 self.tr(u'&S-111 Viewer'),
                 action)
             self.iface.removeToolBarIcon(action)
+
+        if self._scale_signal_connected:
+            try:
+                self.iface.mapCanvas().scaleChanged.disconnect(self._on_scale_changed)
+            except Exception:
+                pass
+            self._scale_signal_connected = False
+
+        if self._scale_change_timer is not None:
+            self._scale_change_timer.stop()
             
         # 清理圖層
         self.clear_layers()
 
     def clear_layers(self):
-        """清除所有已創建的圖層"""
+        """清除所有插件管理的圖層（flow、bathymetry、comparison）"""
+        project = QgsProject.instance()
+
+        # 1. 清除 S-111 流速圖層
         if self.flow_layer:
-            QgsProject.instance().removeMapLayer(self.flow_layer)
+            try:
+                project.removeMapLayer(self.flow_layer.id())
+            except Exception:
+                pass
             self.flow_layer = None
+
+        # 2. 清除 S-102/S-104 水深圖層
+        self.clear_bathymetry_layer()
+
+        # 3. 清除品質比較圖層
+        for _cl in (self.comparison_layer, self.comparison_layer_warning):
+            if _cl:
+                try:
+                    project.removeMapLayer(_cl.id())
+                except Exception:
+                    pass
+        self.comparison_layer = None
+        self.comparison_layer_warning = None
+
+        if self.diff_vector_layer:
+            try:
+                project.removeMapLayer(self.diff_vector_layer.id())
+            except Exception:
+                pass
+            self.diff_vector_layer = None
+
+        for layer in self.uncertainty_hotspot_layers.values():
+            try:
+                project.removeMapLayer(layer.id())
+            except Exception:
+                pass
+        self.uncertainty_hotspot_layers = {}
+
+        # 4. 安全網：按名稱搜尋並移除可能殘留的插件圖層
+        plugin_layer_names = [
+            "S111 Global Flow Data",
+            "S-102/S-104 Dynamic Depth",
+            "QM: 品質異常點",
+            "QM: 預報誤差向量",
+        ]
+        layers_to_remove = []
+        for name in plugin_layer_names:
+            for layer in project.mapLayersByName(name):
+                layers_to_remove.append(layer.id())
+        if layers_to_remove:
+            project.removeMapLayers(layers_to_remove)
+
+        self._flow_raw_cache = None
+        self._hotspot_raw_cache = {}
+        self._comparison_raw_cache = None
+        if self._scale_change_timer is not None:
+            self._scale_change_timer.stop()
+
+        # 5. 刷新畫布
+        self.iface.mapCanvas().refresh()
 
     def log_error(self, message, show_dialog=True):
         """記錄錯誤信息到日志文件並可選擇性地顯示對話框"""
@@ -1172,9 +1495,27 @@ class S111Viewer:
 
     def setup_dialog(self):
         """設置對話框並添加額外控件"""
+        if hasattr(self.dlg, 'btnBrowseManifest'):
+            self.dlg.btnBrowseManifest.setText(self.tr('Browse Manifest / GeoJSON…'))
+            self.dlg.btnBrowseManifest.setToolTip(
+                self.tr('可選 manifest.json、*_spatial_stats_*.geojson 或 *_hotspots.geojson')
+            )
+        if hasattr(self.dlg, 'txtManifestPath'):
+            self.dlg.txtManifestPath.setPlaceholderText(
+                self.tr('選擇 manifest.json 或 GeoJSON…')
+            )
+            self.dlg.txtManifestPath.setToolTip(
+                self.tr('成果包入口可選 manifest.json，也可直接選 spatial_stats / hotspots GeoJSON')
+            )
+        if hasattr(self.dlg, 'comboSpatialMetric'):
+            self.dlg.comboSpatialMetric.setCurrentIndex(0)
+            self.dlg.comboSpatialMetric.setToolTip(
+                self.tr('選擇要載入哪一個 Spatial Stats 指標；選 All 才會一次載入 6 層')
+            )
+
         # 創建並添加「分析文件」按鈕
         if not hasattr(self.dlg, 'btnAnalyzeFile'):
-            self.dlg.btnAnalyzeFile = QPushButton(self.tr('分析文件'), self.dlg)
+            self.dlg.btnAnalyzeFile = QPushButton(self.tr('Parse File'), self.dlg)
             # 假設 btnBrowse 後面有空間放置這個按鈕
             browse_btn = self.dlg.btnBrowse
             layout = browse_btn.parentWidget().layout()
@@ -1190,21 +1531,23 @@ class S111Viewer:
                 layout.insertWidget(index + 1, self.dlg.btnAnalyzeFile)
                 # 連接按鈕信號
                 self.dlg.btnAnalyzeFile.clicked.connect(self.analyze_file)
-                
+
         # 添加檔案列表控件
         self.setup_file_list_widget()
+        # 添加元數據顯示控件
+        self.setup_metadata_widget()
 
     def setup_file_list_widget(self):
         """設置檔案列表控件"""
         if not hasattr(self.dlg, 'fileListWidget'):
             # 創建檔案列表標籤和控件
-            self.dlg.lblFileList = QLabel(self.tr('已載入檔案:'), self.dlg)
+            self.dlg.lblFileList = QLabel(self.tr('Loaded Files:'), self.dlg)
             self.dlg.fileListWidget = QListWidget(self.dlg)
             self.dlg.fileListWidget.setMaximumHeight(100)
             
             # 創建檔案管理按鈕
-            self.dlg.btnRemoveFile = QPushButton(self.tr('移除檔案'), self.dlg)
-            self.dlg.btnClearFiles = QPushButton(self.tr('清除全部'), self.dlg)
+            self.dlg.btnRemoveFile = QPushButton(self.tr('Remove'), self.dlg)
+            self.dlg.btnClearFiles = QPushButton(self.tr('Clear All'), self.dlg)
             
             # 連接信號
             self.dlg.fileListWidget.itemClicked.connect(self.on_file_selected)
@@ -1231,27 +1574,77 @@ class S111Viewer:
             except Exception as e:
                 print(f"設置檔案列表佈局時出錯: {e}")
 
+    def detect_file_type(self, filepath):
+        """自動檢測 HDF5 檔案類型 (S-111, S-102, S-104)"""
+        try:
+            import h5py
+            with h5py.File(filepath, 'r') as f:
+                keys = list(f.keys())
+                print(f"[檔案檢測] {os.path.basename(filepath)}: {keys}")
+
+                # 檢測 S-111 (SurfaceCurrent)
+                if 'SurfaceCurrent' in keys:
+                    return 'S-111'
+
+                # 檢測 S-102 (BathymetryCoverage)
+                if 'BathymetryCoverage' in keys:
+                    return 'S-102'
+
+                # 檢測 S-104 (WaterLevel)
+                if 'WaterLevel' in keys or 'WaterLevelInformation' in keys:
+                    return 'S-104'
+
+                print(f"[檔案檢測] 未知類型，預設為 S-111")
+                return 'S-111'  # 預設為 S-111
+
+        except Exception as e:
+            print(f"[檔案檢測] 錯誤: {e}")
+            return 'S-111'  # 出錯時預設為 S-111
+
     def select_files(self):
-        """打開檔案選擇對話框選擇多個S-111檔案"""
+        """打開檔案選擇對話框，支援 S-111, S-102, S-104"""
         filenames, _ = QFileDialog.getOpenFileNames(
             self.dlg,
-            self.tr('選擇 S-111 檔案'),
+            self.tr('選擇 S-111/S-102/S-104 檔案'),
             '',
             self.tr('HDF5 檔案 (*.h5 *.hdf5);;所有檔案 (*)')
         )
-        
-        if filenames:
+
+        if not filenames:
+            return
+
+        # 檢測每個檔案的類型
+        s111_files = []
+        s102_files = []
+        s104_files = []
+
+        for filepath in filenames:
+            file_type = self.detect_file_type(filepath)
+            if file_type == 'S-111':
+                s111_files.append(filepath)
+            elif file_type == 'S-102':
+                s102_files.append(filepath)
+            elif file_type == 'S-104':
+                s104_files.append(filepath)
+
+        # 載入 S-111 檔案
+        successful_files = []
+        if s111_files:
+            print(f"[載入] {len(s111_files)} 個 S-111 檔案")
             # 初始化多檔案讀取器
             if not self.multi_reader:
                 self.multi_reader = S111MultiFileReader()
-            
+
             # 載入檔案
-            successful_files = self.multi_reader.add_files(filenames)
-            
+            successful_files = self.multi_reader.add_files(s111_files)
+
             if successful_files:
                 # 設定 current_file 為最新加入的檔案
                 self.multi_reader.current_file = successful_files[-1]
                 self.update_file_list()
+
+                # 嘗試自動載入前3天檔案用於四天驗證
+                self._try_auto_load_uncertainty_files(successful_files[-1])
 
                 # 步驟一：先建立圖層，確保 flow_layer 已準備好
                 self.load_current_file()
@@ -1274,28 +1667,1878 @@ class S111Viewer:
                     # 步驟二：在圖層建立後，再更新時間範圍並顯示第一筆資料
                     self.update_time_range()
                 # --- End of new logic ---
-                
-                QMessageBox.information(
-                    self.dlg,
-                    self.tr('檔案載入完成'),
-                    self.tr('成功載入 {} 個檔案，共 {} 個檔案。').format(
-                        len(successful_files), len(filenames)
-                    )
-                )
+
+        # 載入 S-102 檔案（底層水深數據）
+        if s102_files:
+            print(f"[載入] {len(s102_files)} 個 S-102 檔案")
+            for filepath in s102_files:
+                self.s102_filepath = filepath
+
+                # 初始化管理器（如果還沒有）
+                if self.bathymetry_manager is None:
+                    self.bathymetry_manager = S102S104Renderer()
+
+                # 讀取 S-102 數據
+                depth_data = self.bathymetry_manager.read_s102_depth(filepath)
+
+                if depth_data is not None:
+                    # 檢查是否有 S-104 修正值
+                    if self.s104_filepath is None or self.bathymetry_manager.s104_water_level is None:
+                        # 無動態水位修正，使用靜態水深
+                        print("[S-102] 底層數據已載入，顯示靜態水深")
+                        print("[S-102] （若需動態調整，可再載入 S-104 水位修正值）")
+                        self.bathymetry_manager.adjusted_depth = depth_data
+                    else:
+                        # 有 S-104 修正值，執行動態調整
+                        print("[S-102] 檢測到 S-104 修正值，執行動態水位調整...")
+                        self.bathymetry_manager.calculate_dynamic_depth()
+
+                    # 渲染到 QGIS
+                    self._render_bathymetry_to_qgis()
+
+        # 載入 S-104 檔案（動態水位修正值）
+        if s104_files:
+            print(f"[載入] {len(s104_files)} 個 S-104 檔案")
+
+            # 初始化管理器（如果還沒有）
+            if self.bathymetry_manager is None:
+                self.bathymetry_manager = S102S104Renderer()
+
+            for filepath in s104_files:
+                self.s104_filepath = filepath
+
+                # 讀取 S-104 數據（多時間步）
+                water_level = self.bathymetry_manager.read_s104_water_level(filepath)
+
+                if water_level is not None:
+                    # 檢查是否有底層 S-102 數據
+                    if self.s102_filepath is not None and self.bathymetry_manager.s102_depth is not None:
+                        # 有底層數據，使用第一個時間步執行初始渲染
+                        print("[S-104] 檢測到底層 S-102 數據，執行動態調整...")
+                        adjusted_depth = self.bathymetry_manager.calculate_dynamic_depth()
+
+                        if adjusted_depth is not None:
+                            # 渲染到 QGIS
+                            self._render_bathymetry_to_qgis()
+                    else:
+                        # 沒有底層數據，只載入 S-104
+                        print("[S-104] S-104 數據已載入，等待底層 S-102 數據以執行動態調整")
+                        print("[S-104] （根據 IHO 規範，S-104 是修正值，需配合 S-102 底層數據使用）")
+
+            # 【時間軸整合】S-104 時間序列融入滑桿
+            if (self.bathymetry_manager and self.bathymetry_manager.s104_sorted_times
+                    and hasattr(self.dlg, 'dtStartTime')):
+                s104_times = self.bathymetry_manager.s104_sorted_times
+                s104_start = s104_times[0]
+                s104_end = s104_times[-1]
+                print(f"[S-104 時間軸] 整合 {len(s104_times)} 個時間步到滑桿")
+                print(f"  S-104 時間範圍: {s104_start} → {s104_end}")
+
+                s104_qstart = QDateTime(s104_start.year, s104_start.month, s104_start.day,
+                                        s104_start.hour, s104_start.minute, s104_start.second)
+                s104_qend = QDateTime(s104_end.year, s104_end.month, s104_end.day,
+                                      s104_end.hour, s104_end.minute, s104_end.second)
+
+                # 擴展或設定時間範圍
+                current_qstart = self.dlg.dtStartTime.dateTime()
+                current_qend = self.dlg.dtEndTime.dateTime()
+
+                if not self.master_timeline or s104_qstart < current_qstart:
+                    self.dlg.dtStartTime.setDateTime(s104_qstart)
+                if not self.master_timeline or s104_qend > current_qend:
+                    self.dlg.dtEndTime.setDateTime(s104_qend)
+
+                # 重建 master_timeline
+                self.update_time_range()
+
+        # 顯示載入結果
+        result_messages = []
+        if s111_files:
+            if successful_files:
+                result_messages.append(f"S-111: {len(successful_files)} 個檔案")
             else:
-                QMessageBox.warning(
+                result_messages.append(f"S-111: 載入失敗")
+        if s102_files:
+            if self.bathymetry_manager and self.bathymetry_manager.s102_depth is not None:
+                result_messages.append(f"S-102: {len(s102_files)} 個檔案")
+            else:
+                result_messages.append(f"S-102: 載入失敗")
+        if s104_files:
+            if self.bathymetry_manager and self.bathymetry_manager.s104_water_level is not None:
+                result_messages.append(f"S-104: {len(s104_files)} 個檔案")
+            else:
+                result_messages.append(f"S-104: 載入失敗")
+
+        if result_messages:
+            QMessageBox.information(
+                self.dlg,
+                self.tr('檔案載入完成'),
+                self.tr('載入結果:\n\n{}').format('\n'.join(result_messages))
+            )
+        else:
+            QMessageBox.warning(
+                self.dlg,
+                self.tr('載入錯誤'),
+                self.tr('未能載入任何檔案。請檢查檔案格式是否正確。')
+            )
+    
+    def load_comparison_file(self):
+        """Load a comparison S-111 file for quality monitoring"""
+        filename, _ = QFileDialog.getOpenFileName(
+            self.dlg,
+            self.tr('選擇比較檔案 (用於品質監測)'),
+            '',
+            self.tr('HDF5 檔案 (*.h5 *.hdf5);;所有檔案 (*)')
+        )
+        
+        if filename:
+            try:
+                # Create a new S111Reader for comparison
+                self.comparison_reader = S111Reader()
+                success = self.comparison_reader.read_file(filename)
+                
+                if success:
+                    QMessageBox.information(
+                        self.dlg,
+                        self.tr('比較檔案載入成功'),
+                        self.tr('已載入比較檔案：{}').format(os.path.basename(filename))
+                    )
+                    
+                    # Find overlapping time range and update timeline
+                    if hasattr(self, 'multi_reader') and self.multi_reader and self.multi_reader.files:
+                        print("計算重疊時間範圍...")
+                        self.update_timeline_for_comparison()
+                        print("觸發首次品質檢查...")
+                        self.perform_quality_check()
+                    else:
+                        print("尚未載入主檔案，跳過品質檢查")
+                else:
+                    QMessageBox.warning(
+                        self.dlg,
+                        self.tr('載入錯誤'),
+                        self.tr('無法讀取比較檔案。請檢查檔案格式。')
+                    )
+                    self.comparison_reader = None
+            except Exception as e:
+                QMessageBox.critical(
                     self.dlg,
                     self.tr('載入錯誤'),
-                    self.tr('未能載入任何檔案。請檢查檔案格式是否正確。')
+                    self.tr('載入比較檔案時出現錯誤：{}').format(str(e))
                 )
+                self.comparison_reader = None
+    
+    def update_timeline_for_comparison(self):
+        """更新時間軸為重疊時間範圍"""
+        if not self.comparison_reader or not self.multi_reader:
+            return
+            
+        # 獲取主檔案和比較檔案的時間點
+        main_times = set()
+        for reader in self.multi_reader.files.values():
+            main_times.update(reader.time_points)
+        
+        comparison_times = set(self.comparison_reader.time_points)
+        
+        # 計算重疊時間
+        overlapping_times = sorted(main_times.intersection(comparison_times))
+        
+        if overlapping_times:
+            print(f"[QM] 找到 {len(overlapping_times)} 個重疊時間點")
+            print(f"[QM] 重疊範圍: {overlapping_times[0]} 到 {overlapping_times[-1]}")
+            
+            # 更新主時間軸為重疊時間
+            self.master_timeline = overlapping_times
+            
+            # 更新時間選擇器範圍
+            if hasattr(self.dlg, 'dtStartTime') and hasattr(self.dlg, 'dtEndTime'):
+                from qgis.PyQt.QtCore import QDateTime
+                start_qdt = QDateTime()
+                start_qdt.setTime_t(int(overlapping_times[0].timestamp()))
+                end_qdt = QDateTime()
+                end_qdt.setTime_t(int(overlapping_times[-1].timestamp()))
+                
+                self.dlg.dtStartTime.setDateTime(start_qdt)
+                self.dlg.dtEndTime.setDateTime(end_qdt)
+            
+            # 更新滑塊範圍
+            if hasattr(self.dlg, 'sliderTime'):
+                self.dlg.sliderTime.setRange(0, len(overlapping_times) - 1)
+                self.dlg.sliderTime.setValue(0)
+        else:
+            print("[QM] 警告: 沒有找到重疊的時間點")
+
+    # =========================================================
+    # 四天驗證法則 (4-Day Verification / Uncertainty Assessment)
+    # =========================================================
+
+    def _try_auto_load_uncertainty_files(self, main_filepath):
+        """自動載入前3天的 .h5 檔案用於四天驗證（靜默背景載入）
+
+        規則：檔名必須符合 YYYYMMDD.h5 格式，且前3天檔案須在相同資料夾內。
+        """
+        import re
+        basename = os.path.basename(main_filepath)
+        match = re.match(r'^(\d{8})\.h5$', basename, re.IGNORECASE)
+        if not match:
+            print(f"[4-Day] 檔名不符合 YYYYMMDD.h5 格式，跳過自動載入: {basename}")
+            return
+
+        date_str = match.group(1)
+        try:
+            base_date = datetime.datetime.strptime(date_str, '%Y%m%d')
+        except ValueError:
+            print(f"[4-Day] 無法解析日期: {date_str}")
+            return
+
+        dir_path = os.path.dirname(main_filepath)
+        self.uncertainty_readers = {}
+
+        for offset in range(1, 4):  # 前1, 2, 3天
+            prev_date = base_date - datetime.timedelta(days=offset)
+            prev_filename = prev_date.strftime('%Y%m%d') + '.h5'
+            prev_filepath = os.path.join(dir_path, prev_filename)
+
+            if os.path.exists(prev_filepath):
+                reader = S111Reader()
+                success = reader.read_file(prev_filepath)
+                if success:
+                    self.uncertainty_readers[offset] = reader
+                    print(f"[4-Day] 成功載入 -{offset}天 檔案: {prev_filename}")
+                else:
+                    print(f"[4-Day] 無法讀取: {prev_filename}")
+            else:
+                print(f"[4-Day] 找不到 -{offset}天 檔案: {prev_filepath}")
+
+        if self.uncertainty_readers:
+            print(f"[4-Day] 共自動載入 {len(self.uncertainty_readers)} 個歷史檔案，可執行四天驗證")
+        else:
+            print("[4-Day] 沒有找到任何歷史檔案，四天驗證功能暫不可用")
+
+    def evaluate_model_uncertainty(self):
+        """四天驗證法則：用主檔案（今天）後報驗證前3天預報的不確定性
+
+        - Truth_Speed    = 主檔案在 target_time 的後報速度
+        - Forecast_24h   = 前1天檔案在同一 target_time 的預報速度
+        - Forecast_48h   = 前2天檔案在同一 target_time 的預報速度
+        - Forecast_72h   = 前3天檔案在同一 target_time 的預報速度
+        - 計算 RMSE / 偏差 / 最大誤差，並在 txtMetadata 顯示
+        - 24h 預報誤差 > 0.5 節的點繪製橙色熱點圖層
+        """
+        if not self.multi_reader or not self.multi_reader.current_file:
+            QMessageBox.warning(self.dlg, self.tr('四天驗證'), self.tr('請先載入主檔案 (YYYYMMDD.h5)'))
+            return
+
+        if not self.uncertainty_readers:
+            QMessageBox.warning(
+                self.dlg, self.tr('四天驗證'),
+                self.tr('沒有找到前3天的歷史 .h5 檔案。\n'
+                        '請確認同一資料夾內有連續4天的檔案\n'
+                        '（例如：20260315.h5, 20260316.h5, 20260317.h5）')
+            )
+            return
+
+        current_reader = self.multi_reader.get_current_reader()
+        if not current_reader:
+            return
+
+        if not hasattr(self, 'master_timeline') or not self.master_timeline:
+            QMessageBox.warning(self.dlg, self.tr('四天驗證'), self.tr('請先設定時間範圍'))
+            return
+
+        slider_idx = self.dlg.sliderTime.value() if hasattr(self.dlg, 'sliderTime') else 0
+        if slider_idx >= len(self.master_timeline):
+            slider_idx = 0
+        target_time = self.master_timeline[slider_idx]
+
+        THRESHOLD_SECONDS = 1800   # 時間容差：30 分鐘
+        # THRESHOLD_KNOTS 代表 24h 熱點的 warning 門檻。
+
+        # ── 檢查滑桿是否在後報日（主檔案 YYYYMMDD 當天）────────
+        import re as _re
+        basename = os.path.basename(current_reader.filename)
+        m = _re.match(r'^(\d{8})\.h5$', basename, _re.IGNORECASE)
+        if m:
+            hindcast_date = datetime.datetime.strptime(m.group(1), '%Y%m%d').date()
+            if target_time.date() != hindcast_date:
+                QMessageBox.warning(
+                    self.dlg, self.tr('四天驗證'),
+                    self.tr(f'目前時間 {target_time.strftime("%Y-%m-%d")} 是預報日，'
+                            f'非後報日（{hindcast_date}）。\n'
+                            f'請將滑桿調回 {hindcast_date} 再執行驗證。')
+                )
+                return
+
+        # ── 1. 取 Truth_Speed（今天後報）─────────────────────
+        truth_index = None
+        for i, tp in enumerate(current_reader.time_points):
+            if abs((tp - target_time).total_seconds()) < THRESHOLD_SECONDS:
+                truth_index = i
+                break
+
+        if truth_index is None:
+            msg = (f"[四天驗證] 在主檔案找不到目標時間:\n{target_time}\n"
+                   f"請調整時間滑桿到有效的時間點。")
+            if hasattr(self.dlg, 'txtMetadata'):
+                self.dlg.txtMetadata.setText(msg)
+            return
+
+        truth_surface = current_reader.surfaces[truth_index]
+        truth_speed = truth_surface[0] if isinstance(truth_surface, (list, tuple)) else truth_surface
+        if truth_speed.ndim == 3:
+            truth_speed = truth_speed[..., 0]
+
+        # ── 2. 取各歷史檔案的預報速度 ────────────────────────
+        forecast_speeds = {}
+        forecast_times  = {}
+        for offset, reader in self.uncertainty_readers.items():
+            for i, tp in enumerate(reader.time_points):
+                if abs((tp - target_time).total_seconds()) < THRESHOLD_SECONDS:
+                    surface = reader.surfaces[i]
+                    spd = surface[0] if isinstance(surface, (list, tuple)) else surface
+                    if spd.ndim == 3:
+                        spd = spd[..., 0]
+                    forecast_speeds[offset] = spd
+                    forecast_times[offset]  = tp
+                    break
+
+        if not forecast_speeds:
+            msg = (f"[四天驗證] 歷史檔案中找不到與目標時間對應的資料:\n{target_time}")
+            if hasattr(self.dlg, 'txtMetadata'):
+                self.dlg.txtMetadata.setText(msg)
+            return
+
+        # ── 3. 計算誤差統計 ──────────────────────────────────
+        label_map = {1: '24h 預報', 2: '48h 預報', 3: '72h 預報'}
+        results = {}
+        for offset, fc_speed in forecast_speeds.items():
+            min_rows = min(truth_speed.shape[0], fc_speed.shape[0])
+            min_cols = min(truth_speed.shape[1], fc_speed.shape[1])
+            t_crop = truth_speed[:min_rows, :min_cols]
+            f_crop = fc_speed[:min_rows, :min_cols]
+            valid_mask = (t_crop > 0) & (f_crop > 0)
+            if np.any(valid_mask):
+                error = np.abs(f_crop - t_crop)
+                rmse  = np.sqrt(np.mean(error[valid_mask] ** 2))
+                bias  = np.mean(f_crop[valid_mask] - t_crop[valid_mask])
+                max_e = np.max(error[valid_mask])
+                # std 保留作為描述統計，但熱點門檻改採固定值 0.5 / 1.0 kn。
+                signed_diff = f_crop[valid_mask] - t_crop[valid_mask]
+                std_e     = np.std(signed_diff)
+                threshold = HOTSPOT_WARN_KN
+                results[offset] = {
+                    'rmse': rmse, 'bias': bias, 'max_err': max_e,
+                    'error': error, 'valid_mask': valid_mask,
+                    'rows': min_rows, 'cols': min_cols,
+                    'std': std_e, 'threshold': threshold
+                }
+
+        # ── 4. 取 24h 閾值用於熱點繪製 ──────────────────────────
+        THRESHOLD_KNOTS = results[1]['threshold'] if 1 in results else HOTSPOT_WARN_KN
+
+        # ── 5. 組建文字報告 ──────────────────────────────────
+        lines = [
+            "=" * 46,
+            "  四天驗證法則 - 預報不確定性評估報告",
+            "=" * 46,
+            f"  目標時間 : {target_time.strftime('%Y-%m-%d %H:%M UTC')}",
+            f"  真值來源 : {os.path.basename(current_reader.filename)}",
+            "-" * 46,
+        ]
+        for offset in sorted(results.keys()):
+            r = results[offset]
+            label   = label_map.get(offset, f'{offset*24}h 預報')
+            fc_name = os.path.basename(self.uncertainty_readers[offset].filename)
+            lines += [
+                f"  [{label}]  {fc_name}",
+                f"    RMSE       : {r['rmse']:.4f} 節",
+                f"    偏差       : {r['bias']:+.4f} 節",
+                f"    最大誤差   : {r['max_err']:.4f} 節",
+                f"    Warning threshold : {r['threshold']:.4f} 節",
+                "",
+            ]
+        if results:
+            lines += [
+                "-" * 46,
+                f"  熱點依據 : 24h warning threshold {THRESHOLD_KNOTS:.4f} 節",
+                "=" * 46,
+            ]
+        else:
+            lines.append("  (無有效比對點)")
+
+        if hasattr(self.dlg, 'txtMetadata'):
+            self.dlg.txtMetadata.setText('\n'.join(lines))
+
+        # ── 5. 繪製 24h 誤差熱點圖層 ────────────────────────
+        if 1 in results and current_reader.geotransform is not None:
+            r = results[1]
+            above = (r['error'] >= THRESHOLD_KNOTS) & r['valid_mask']
+            y_idx, x_idx = np.where(above)
+            err_vals = r['error'][y_idx, x_idx]
+
+            raw_surface = current_reader.surfaces[truth_index]
+            if isinstance(raw_surface, (list, tuple)) and len(raw_surface) >= 2:
+                dir_matrix = raw_surface[1]
+                if dir_matrix.ndim == 3:
+                    dir_matrix = dir_matrix[..., 0]
+                dir_vals = dir_matrix[y_idx, x_idx]
+            else:
+                dir_vals = np.zeros(len(y_idx))
+
+        # ── 6. 繪製各預報時距的誤差熱點圖層 ─────────────────────
+        for offset in sorted(results.keys()):
+            r = results[offset]
+            above = (r['error'] >= r['threshold']) & r['valid_mask']
+            y_idx, x_idx = np.where(above)
+            err_vals = r['error'][y_idx, x_idx]
+            severity_vals = np.where(
+                err_vals >= HOTSPOT_CRITICAL_KN,
+                'critical',
+                'warning'
+            )
+
+            raw_surface = current_reader.surfaces[truth_index]
+            if isinstance(raw_surface, (list, tuple)) and len(raw_surface) >= 2:
+                dir_matrix = raw_surface[1]
+                if dir_matrix.ndim == 3:
+                    dir_matrix = dir_matrix[..., 0]
+                dir_vals = dir_matrix[y_idx, x_idx]
+            else:
+                dir_vals = np.zeros(len(y_idx))
+            truth_speed_vals = truth_speed[y_idx, x_idx]
+
+            print(f"[4-Day] {offset*24}h 熱點: {len(y_idx)} 個 (>{r['threshold']:.4f} 節)")
+            self._update_uncertainty_hotspot_layer(
+                offset, y_idx, x_idx, err_vals, current_reader.geotransform, dir_vals,
+                truth_speed_vals, severity_vals
+            )
+
+        # 清除沒有資料的時距圖層
+        valid_offsets = set(results.keys())
+        for layer_key in list(self.uncertainty_hotspot_layers.keys()):
+            offset = layer_key[0] if isinstance(layer_key, tuple) else layer_key
+            if offset not in valid_offsets:
+                layer = self.uncertainty_hotspot_layers.pop(layer_key, None)
+                if layer and layer.isValid():
+                    try:
+                        QgsProject.instance().removeMapLayer(layer.id())
+                    except Exception:
+                        pass
+                self._hotspot_raw_cache.pop(offset, None)
+
+        print("[4-Day] 四天驗證完成")
+
+    # ── 資料庫連線設定（與 verification_pipeline.py 相同）────────
+    DB_CONFIG = {
+        'host':     'localhost',
+        'port':     5432,
+        'dbname':   's111_verification',
+        'user':     'postgres',
+        'password': '123456',
+    }
+    H5_DIR = r'C:\Users\Rong\Desktop\test_h5_files'
+
+    def load_hotspots_from_db(self):
+        """從 PostgreSQL 讀取最新驗證結果，即時從 .h5 計算熱點並繪製"""
+        try:
+            import psycopg2
+        except ImportError:
+            QMessageBox.warning(self.dlg, '資料庫', '請先安裝 psycopg2：\npip install psycopg2-binary')
+            return
+
+        conn = None
+        try:
+            conn = psycopg2.connect(**self.DB_CONFIG)
+        except Exception as e:
+            QMessageBox.warning(self.dlg, '資料庫連線失敗', str(e))
+            return
+
+        try:
+            with conn.cursor() as cur:
+                # 確保資料表存在
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS verification_summary_stats (
+                        id            SERIAL PRIMARY KEY,
+                        target_date DATE,
+                        target_timestamp TIMESTAMP,
+                        forecast_lead_hours INTEGER,
+                        forecast_file TEXT,
+                        rmse          FLOAT,
+                        bias          FLOAT,
+                        max_error     FLOAT,
+                        threshold     FLOAT,
+                        dir_rmse      FLOAT,
+                        dir_bias      FLOAT,
+                        dir_max_error FLOAT,
+                        dir_threshold FLOAT,
+                        UNIQUE (target_date, target_timestamp, forecast_lead_hours)
+                    );
+                """)
+                cur.execute("""
+                    ALTER TABLE verification_summary_stats
+                        ADD COLUMN IF NOT EXISTS dir_rmse FLOAT,
+                        ADD COLUMN IF NOT EXISTS dir_bias FLOAT,
+                        ADD COLUMN IF NOT EXISTS dir_max_error FLOAT,
+                        ADD COLUMN IF NOT EXISTS dir_threshold FLOAT;
+                """)
+                conn.commit()
+
+                # 取最新後報日期、最後時間點，每個時距一筆
+                cur.execute("""
+                    SELECT DISTINCT ON (forecast_lead_hours)
+                        target_date, target_timestamp, forecast_lead_hours,
+                        forecast_file, rmse, bias, max_error, threshold,
+                        dir_rmse, dir_bias, dir_max_error, dir_threshold
+                    FROM verification_summary_stats
+                    ORDER BY forecast_lead_hours, target_date DESC, target_timestamp DESC
+                """)
+                rows = cur.fetchall()
+
+            conn.close()
+            conn = None
+
+            if not rows:
+                QMessageBox.information(self.dlg, '資料庫', '資料庫中尚無驗證結果')
+                return
+
+            hindcast_date = rows[0][0]
+            target_time   = rows[0][1]
+
+            # 組建文字報告
+            lines = [
+                "=" * 46,
+                "  資料庫驗證結果（最新）",
+                "=" * 46,
+                f"  後報日期   : {hindcast_date}",
+                f"  目標時間   : {target_time}",
+                "-" * 46,
+            ]
+            label_map = {24: '24h 預報', 48: '48h 預報', 72: '72h 預報'}
+            for row in rows:
+                (
+                    _, _, offset_h, fc_file, rmse, bias, max_e, threshold,
+                    dir_rmse, dir_bias, dir_max_err, dir_threshold
+                ) = row
+                lines += [
+                    f"  [{label_map.get(offset_h, f'{offset_h}h')}]  {fc_file}",
+                    f"    RMSE       : {rmse:.4f} 節",
+                    f"    偏差       : {bias:+.4f} 節",
+                    f"    最大誤差   : {max_e:.4f} 節",
+                    f"    Warning threshold : {threshold:.4f} 節",
+                    (
+                        f"    流向 RMSE    : {dir_rmse:.2f}°"
+                        if dir_rmse is not None else
+                        "    流向 RMSE    : N/A"
+                    ),
+                    (
+                        f"    流向偏差     : {dir_bias:+.2f}°"
+                        if dir_bias is not None else
+                        "    流向偏差     : N/A"
+                    ),
+                    (
+                        f"    流向最大誤差 : {dir_max_err:.2f}°"
+                        if dir_max_err is not None else
+                        "    流向最大誤差 : N/A"
+                    ),
+                    "",
+                ]
+            lines.append("=" * 46)
+            if hasattr(self.dlg, 'txtMetadata'):
+                self.dlg.txtMetadata.setText('\n'.join(lines))
+
+            # 清除舊的資料庫熱點圖層（speed / direction）
+            for key in list(self.uncertainty_hotspot_layers.keys()):
+                if isinstance(key, tuple) and len(key) == 2 and key[1] in ('speed', 'direction'):
+                    layer = self.uncertainty_hotspot_layers.pop(key, None)
+                    if layer and layer.isValid():
+                        try:
+                            QgsProject.instance().removeMapLayer(layer.id())
+                        except Exception:
+                            pass
+
+            # 即時從 .h5 計算熱點
+            hindcast_h5 = os.path.join(self.H5_DIR, str(hindcast_date).replace('-', '') + '.h5')
+            if not os.path.exists(hindcast_h5):
+                QMessageBox.warning(self.dlg, '找不到後報檔案', f'請確認檔案存在:\n{hindcast_h5}')
+                return
+
+            truth_speed, truth_dir, truth_gt = self._read_h5_at_time(hindcast_h5, target_time)
+            if truth_speed is None:
+                QMessageBox.warning(self.dlg, '讀取失敗', '無法讀取後報 .h5 檔案')
+                return
+
+            offset_map = {24: 1, 48: 2, 72: 3}
+            for row in rows:
+                (
+                    _, _, offset_h, fc_file, _, _, _, threshold,
+                    dir_rmse, dir_bias, dir_max_err, dir_threshold
+                ) = row
+                fc_path = os.path.join(self.H5_DIR, fc_file)
+                if not os.path.exists(fc_path):
+                    print(f"[資料庫] 找不到預報檔案: {fc_path}")
+                    continue
+
+                fc_speed, fc_dir, _ = self._read_h5_at_time(fc_path, target_time)
+                if fc_speed is None:
+                    continue
+
+                min_rows = min(truth_speed.shape[0], fc_speed.shape[0])
+                min_cols = min(truth_speed.shape[1], fc_speed.shape[1])
+                t_crop = truth_speed[:min_rows, :min_cols]
+                f_crop = fc_speed[:min_rows,   :min_cols]
+
+                valid_mask = (t_crop > 0) & (f_crop > 0)
+                error = np.abs(f_crop - t_crop)
+                above = (error > threshold) & valid_mask
+
+                if np.any(above) and truth_gt:
+                    gt = truth_gt
+                    r_idx, c_idx = np.where(above)
+                    lons = gt[0] + c_idx * gt[1]
+                    lats = gt[3] + r_idx * gt[5]
+                    errs = error[r_idx, c_idx]
+                    self._draw_db_hotspot_layer(
+                        offset_map.get(offset_h, 1), lons, lats, errs,
+                        error_type='speed'
+                    )
+                    print(f"[資料庫] {offset_h}h 繪製 {len(lons)} 個熱點")
+
+        except Exception as e:
+            QMessageBox.warning(self.dlg, '資料庫讀取失敗', str(e))
+            if conn:
+                conn.close()
+
+    def _read_h5_at_time(self, h5_path, target_time):
+        """從 .h5 讀取最接近 target_time 的速度/流向資料。"""
+        import datetime as _dt
+        THRESHOLD_SECONDS = 1800
+        try:
+            with h5py.File(h5_path, 'r') as f:
+                try:
+                    meta = {k: (v.decode('utf-8') if isinstance(v, bytes) else v) for k, v in f.attrs.items()}
+                    gt = [
+                        float(meta.get('westBoundLongitude', 0)),
+                        float(meta.get('gridSpacingLongitudinal', 0.01)),
+                        0,
+                        float(meta.get('northBoundLatitude', 0)),
+                        0,
+                        -float(meta.get('gridSpacingLatitudinal', 0.01)),
+                    ]
+                except Exception:
+                    gt = None
+
+                sc = f.get('SurfaceCurrent', f.get('SurfaceCurrent.01', None))
+                if sc is None:
+                    return None, None, None
+                sc01 = sc.get('SurfaceCurrent.01', sc)
+                groups = sorted(
+                    [g for g in sc01 if g.startswith('Group_')],
+                    key=lambda x: int(x.split('_')[1])
+                )
+                for gn in groups:
+                    grp = sc01[gn]
+                    tp = None
+                    for tf in ['timePoint', 'timepoint', 'time', 'Time']:
+                        raw = grp.attrs.get(tf) or (grp[tf][()] if tf in grp else None)
+                        if raw is not None:
+                            if isinstance(raw, bytes):
+                                raw = raw.decode('utf-8')
+                            try:
+                                tp = _dt.datetime.fromisoformat(raw.rstrip('Z'))
+                            except Exception:
+                                pass
+                            break
+                    if tp is None:
+                        continue
+                    if abs((tp - target_time).total_seconds()) > THRESHOLD_SECONDS:
+                        continue
+                    speed = None
+                    direction = None
+                    if 'values' in grp:
+                        vals = grp['values'][()]
+                        if hasattr(vals.dtype, 'names') and vals.dtype.names:
+                            if 'surfaceCurrentSpeed' in vals.dtype.names:
+                                speed = vals['surfaceCurrentSpeed']
+                            if 'surfaceCurrentDirection' in vals.dtype.names:
+                                direction = vals['surfaceCurrentDirection']
+                    if speed is None:
+                        for sf in ['surfaceCurrentSpeed', 'speed', 'Speed']:
+                            if sf in grp:
+                                speed = grp[sf][()]
+                                break
+                    if direction is None:
+                        for df in ['surfaceCurrentDirection', 'direction', 'Direction']:
+                            if df in grp:
+                                direction = grp[df][()]
+                                break
+                    if speed is None:
+                        continue
+                    speed = np.flipud(speed)
+                    if direction is not None:
+                        direction = np.flipud(direction)
+                    return speed, direction, gt
+        except Exception as e:
+            print(f"[讀取] {h5_path}: {e}")
+        return None, None, None
+
+    def _draw_db_hotspot_layer(self, offset, lons, lats, errors, error_type='speed'):
+        """從資料庫座標直接繪製熱點圖層"""
+        import re as _re
+        import tempfile
+
+        color_map = {
+            1: ('#FF0000', '#CC0000', 'DB: 24h 預報誤差熱點'),
+            2: ('#FF8C00', '#CC6600', 'DB: 48h 預報誤差熱點'),
+            3: ('#FFD700', '#CC9900', 'DB: 72h 預報誤差熱點'),
+        }
+        fill_color, default_stroke_color, base_layer_name = color_map.get(
+            offset, ('#FF0000', '#CC0000', 'DB 熱點')
+        )
+        if error_type == 'direction':
+            stroke_color = '#1E90FF'
+            layer_name = base_layer_name.replace('預報誤差熱點', '流向誤差熱點')
+        else:
+            stroke_color = default_stroke_color
+            layer_name = base_layer_name
+        layer_key = (offset, error_type)
+
+        # 清除舊圖層
+        layer = self.uncertainty_hotspot_layers.get(layer_key)
+        if layer and layer.isValid():
+            layer.dataProvider().truncate()
+        else:
+            layer = QgsVectorLayer("Point?crs=EPSG:4326", layer_name, "memory")
+            provider = layer.dataProvider()
+            provider.addAttributes([
+                QgsField("Error_kn",  QVariant.Double),
+                QgsField("Direction", QVariant.Double),
+            ])
+            layer.updateFields()
+
+            plugin_dir  = os.path.dirname(os.path.abspath(__file__))
+            catalog_path = os.path.join(
+                plugin_dir, "S-111", "CATALOGUES",
+                "111_Portrayal_Catalogue_2.0.0", "PC", "XSLT", "Symbols"
+            )
+            svg_path = os.path.join(catalog_path, "SCAROW01.svg")
+            css = (
+                ".sl {stroke-linecap:round;stroke-linejoin:round}\n"
+                ".f0 {fill:none}\n"
+                f".sCHBLK {{stroke:{stroke_color}}}\n"
+                ".fSCBN1,.fSCBN2,.fSCBN3,.fSCBN4,.fSCBN5,"
+                f".fSCBN6,.fSCBN7,.fSCBN8,.fSCBN9 "
+                f"{{fill:{fill_color}; fill-opacity:0.7}}\n"
+            )
+            symbol = QgsMarkerSymbol()
+            if symbol.symbolLayerCount() > 0:
+                symbol.deleteSymbolLayer(0)
+
+            if os.path.exists(svg_path):
+                with open(svg_path, 'r', encoding='utf-8') as f:
+                    svg_raw = f.read()
+                svg_processed = _re.sub(r'<\?xml-stylesheet.*?\?>', '', svg_raw)
+                style_element = f'<style type="text/css"><![CDATA[\n{css}\n]]></style>'
+                m = _re.search(r'<svg[^>]*>', svg_processed)
+                svg_final = (svg_processed[:m.end()] + style_element + svg_processed[m.end():]
+                             if m else style_element + svg_processed)
+                tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.svg', delete=False, encoding='utf-8')
+                tmp.write(svg_final)
+                tmp.close()
+                map_layer = QgsSvgMarkerSymbolLayer(tmp.name)
+                map_layer.setSize(6.0)
+                map_layer.setSizeUnit(QgsUnitTypes.RenderMillimeters)
+                symbol.appendSymbolLayer(map_layer)
+
+            layer.setRenderer(QgsSingleSymbolRenderer(symbol))
+            QgsProject.instance().addMapLayer(layer)
+            self.uncertainty_hotspot_layers[layer_key] = layer
+
+        # 寫入熱點 Feature
+        features = []
+        for lon, lat, err in zip(lons, lats, errors):
+            feat = QgsFeature(layer.fields())
+            feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(float(lon), float(lat))))
+            feat.setAttributes([float(err), 0.0])
+            features.append(feat)
+
+        layer.dataProvider().addFeatures(features)
+        layer.updateExtents()
+        layer.triggerRepaint()
+        print(f"[資料庫] offset={offset} type={error_type} 繪製 {len(features)} 個熱點")
+
+    def _recalculate_uncertainty_hotspot(self, slider_index):
+        """隨滑桿更新四天驗證熱點圖層（靜默版，不顯示對話框或修改 txtMetadata）"""
+        if not self.uncertainty_readers or not self.multi_reader:
+            return
+
+        current_reader = self.multi_reader.get_current_reader()
+        if not current_reader or not hasattr(self, 'master_timeline') or not self.master_timeline:
+            return
+        if slider_index >= len(self.master_timeline):
+            return
+
+        target_time = self.master_timeline[slider_index]
+        THRESHOLD_SECONDS = 1800
+        # THRESHOLD_KNOTS 將在計算完誤差後動態算出
+
+        # ── 只在後報日（主檔案 YYYYMMDD 當天）才顯示熱點 ──
+        # 主檔案 Day 1 才是後報/真值，Day 2-4 是預報，不能當真值
+        import re as _re
+        basename = os.path.basename(current_reader.filename)
+        m = _re.match(r'^(\d{8})\.h5$', basename, _re.IGNORECASE)
+        if m:
+            hindcast_date = datetime.datetime.strptime(m.group(1), '%Y%m%d').date()
+            if target_time.date() != hindcast_date:
+                        # 滑桿在預報日，清空所有熱點圖層並返回
+                for lyr in self.uncertainty_hotspot_layers.values():
+                    try:
+                        lyr.dataProvider().truncate()
+                        lyr.triggerRepaint()
+                    except Exception:
+                        pass
+                return
+
+        # 找 Truth_Speed
+        truth_index = None
+        for i, tp in enumerate(current_reader.time_points):
+            if abs((tp - target_time).total_seconds()) < THRESHOLD_SECONDS:
+                truth_index = i
+                break
+        if truth_index is None:
+            return
+
+        truth_surface = current_reader.surfaces[truth_index]
+        truth_speed = truth_surface[0] if isinstance(truth_surface, (list, tuple)) else truth_surface
+        if truth_speed.ndim == 3:
+            truth_speed = truth_speed[..., 0]
+
+        # 取主檔案方向矩陣（各時距共用）
+        raw_surface = current_reader.surfaces[truth_index]
+        dir_matrix_full = None
+        if isinstance(raw_surface, (list, tuple)) and len(raw_surface) >= 2:
+            dir_matrix_full = raw_surface[1]
+            if dir_matrix_full.ndim == 3:
+                dir_matrix_full = dir_matrix_full[..., 0]
+
+        # 對每個可用時距計算誤差並繪製熱點
+        for offset, reader in self.uncertainty_readers.items():
+            fc_speed = None
+            for i, tp in enumerate(reader.time_points):
+                if abs((tp - target_time).total_seconds()) < THRESHOLD_SECONDS:
+                    surface = reader.surfaces[i]
+                    spd = surface[0] if isinstance(surface, (list, tuple)) else surface
+                    if spd.ndim == 3:
+                        spd = spd[..., 0]
+                    fc_speed = spd
+                    break
+            if fc_speed is None:
+                continue
+
+            min_rows = min(truth_speed.shape[0], fc_speed.shape[0])
+            min_cols = min(truth_speed.shape[1], fc_speed.shape[1])
+            t_crop = truth_speed[:min_rows, :min_cols]
+            f_crop = fc_speed[:min_rows, :min_cols]
+            valid_mask = (t_crop > 0) & (f_crop > 0)
+            error = np.abs(f_crop - t_crop)
+
+            # IHO S-111 E-6.2：用帶正負號差異的標準差
+            threshold = HOTSPOT_WARN_KN
+            above = (error >= threshold) & valid_mask
+            y_idx, x_idx = np.where(above)
+
+            if len(y_idx) == 0:
+                self._hotspot_raw_cache.pop(offset, None)
+                for severity_key in ("warning", "critical"):
+                    layer = self.uncertainty_hotspot_layers.get((offset, severity_key))
+                    if layer and layer.isValid():
+                        try:
+                            layer.dataProvider().truncate()
+                            layer.triggerRepaint()
+                        except Exception:
+                            pass
+                continue
+
+            err_vals = error[y_idx, x_idx]
+            severity_vals = np.where(err_vals >= HOTSPOT_CRITICAL_KN, 'critical', 'warning')
+            if dir_matrix_full is not None:
+                dir_vals = dir_matrix_full[y_idx, x_idx]
+            else:
+                dir_vals = np.zeros(len(y_idx))
+            truth_speed_vals = truth_speed[y_idx, x_idx]
+
+            self._update_uncertainty_hotspot_layer(
+                offset, y_idx, x_idx, err_vals, current_reader.geotransform, dir_vals,
+                truth_speed_vals, severity_vals
+            )
+
+    def _update_uncertainty_hotspot_layer(self, offset, y_indices, x_indices,
+                                           error_values, geotransform, directions=None,
+                                           speed_values=None, severity_values=None):
+        """繪製預報誤差熱點圖層，保留原始 S-111 箭頭並用外層同形 SVG 做彩色外框。"""
+        import re as _re
+        import tempfile
+
+        layer_name_map = {
+            1: '4-Day: 24h 預報誤差熱點',
+            2: '4-Day: 48h 預報誤差熱點',
+            3: '4-Day: 72h 預報誤差熱點',
+        }
+        layer_name = layer_name_map.get(offset, f'4-Day: {offset*24}h 誤差熱點')
+
+        y_indices = np.asarray(y_indices)
+        x_indices = np.asarray(x_indices)
+        error_values = np.asarray(error_values)
+        directions = np.asarray(directions) if directions is not None else None
+        speed_values = np.asarray(speed_values) if speed_values is not None else None
+        severity_values = (
+            np.asarray(severity_values)
+            if severity_values is not None else
+            np.where(error_values >= HOTSPOT_CRITICAL_KN, 'critical', 'warning')
+        )
+
+        if len(y_indices) > 0:
+            max_speed_val = float(np.max(speed_values)) if speed_values is not None and len(speed_values) > 0 else 1.0
+            self._hotspot_raw_cache[offset] = {
+                'y_indices_full': y_indices.copy(),
+                'x_indices_full': x_indices.copy(),
+                'error_values_full': error_values.copy(),
+                'geotransform': geotransform,
+                'directions_full': directions.copy() if directions is not None else None,
+                'speed_values_full': speed_values.copy() if speed_values is not None else None,
+                'severity_values_full': severity_values.copy() if severity_values is not None else None,
+                'max_speed': max_speed_val,
+            }
+        else:
+            self._hotspot_raw_cache.pop(offset, None)
+
+        def _strip_svg_outline_path(svg_text):
+            return _re.sub(r'<path[^>]*class="[^"]*sCHBLK[^"]*"[^>]*/>\s*', '', svg_text, count=1)
+
+        def _build_inner_svg_path(svg_path, css_content):
+            if not os.path.exists(svg_path):
+                return None
+
+            with open(svg_path, 'r', encoding='utf-8') as handle:
+                svg_raw = handle.read()
+            svg_processed = _re.sub(r'<\?xml-stylesheet.*?\?>', '', svg_raw)
+            svg_processed = _strip_svg_outline_path(svg_processed)
+            style_element = f'<style type="text/css"><![CDATA[\n{css_content}\n]]></style>'
+            match = _re.search(r'<svg[^>]*>', svg_processed)
+            svg_final = (
+                svg_processed[:match.end()] + style_element + svg_processed[match.end():]
+                if match else style_element + svg_processed
+            )
+
+            tmp_svg = tempfile.NamedTemporaryFile(mode='w', suffix='.svg', delete=False, encoding='utf-8')
+            tmp_svg.write(svg_final)
+            tmp_svg.close()
+            return tmp_svg.name
+
+        def _build_outline_svg_path(svg_path, outline_color):
+            if not os.path.exists(svg_path):
+                return None
+
+            with open(svg_path, 'r', encoding='utf-8') as handle:
+                svg_raw = handle.read()
+            svg_processed = _re.sub(r'<\?xml-stylesheet.*?\?>', '', svg_raw)
+            svg_processed = _strip_svg_outline_path(svg_processed)
+            svg_processed = _re.sub(
+                r'class="fSCBN\d+"',
+                (
+                    f'fill="none" stroke="{outline_color}" stroke-opacity="1" '
+                    f'stroke-width="0.6" stroke-linecap="round" stroke-linejoin="round"'
+                ),
+                svg_processed,
+                count=1
+            )
+
+            tmp_svg = tempfile.NamedTemporaryFile(mode='w', suffix='.svg', delete=False, encoding='utf-8')
+            tmp_svg.write(svg_processed)
+            tmp_svg.close()
+            return tmp_svg.name
+
+        def _build_hotspot_renderer(outline_color):
+            plugin_dir = os.path.dirname(os.path.abspath(__file__))
+            catalog_path = os.path.join(
+                plugin_dir, "S-111", "CATALOGUES",
+                "111_Portrayal_Catalogue_2.0.0", "PC", "XSLT", "Symbols"
+            )
+            mode = "day"
+            if hasattr(self.dlg, 'cmbDisplayMode'):
+                mode = self.dlg.cmbDisplayMode.currentText().lower()
+
+            css_filename = f"SVGStyle_S111{mode}.css"
+            css_path = os.path.join(catalog_path, css_filename)
+            css_content = ""
+            if os.path.exists(css_path):
+                with open(css_path, 'r', encoding='utf-8') as handle:
+                    css_content = handle.read()
+            else:
+                fallback = os.path.join(catalog_path, "SVGStyle_S111day.css")
+                if os.path.exists(fallback):
+                    with open(fallback, 'r', encoding='utf-8') as handle:
+                        css_content = handle.read()
+
+            base_size = 6.0
+            outline_margin = 0.4
+            inner_size_expr = f"""
+            CASE
+                WHEN "Speed" <= {S111Standards.SLOW} THEN {base_size} * {S111Standards.SCALE_FLOOR}
+                WHEN "Speed" >= {S111Standards.SHIGH} THEN {base_size} * {S111Standards.SCALE_CEILING}
+                ELSE {base_size} * ("Speed" * {S111Standards.SCALE_FACTOR_INTERMEDIATE})
+            END
+            """
+            outer_size_expr = f"""
+            CASE
+                WHEN "Speed" <= {S111Standards.SLOW} THEN ({base_size} * {S111Standards.SCALE_FLOOR}) + {outline_margin}
+                WHEN "Speed" >= {S111Standards.SHIGH} THEN ({base_size} * {S111Standards.SCALE_CEILING}) + {outline_margin}
+                ELSE ({base_size} * ("Speed" * {S111Standards.SCALE_FACTOR_INTERMEDIATE})) + {outline_margin}
+            END
+            """
+
+            inner_svg_paths = {}
+            outline_svg_paths = {}
+            for band_num, (_min_speed, _max_speed, _color) in enumerate(S111Standards.SPEED_BANDS, start=1):
+                svg_path = os.path.join(catalog_path, f"SCAROW{band_num:02d}.svg")
+                original_svg_path = _build_inner_svg_path(svg_path, css_content)
+                outline_svg_path = _build_outline_svg_path(svg_path, outline_color)
+                if original_svg_path is None or outline_svg_path is None:
+                    continue
+                inner_svg_paths[band_num] = original_svg_path
+                outline_svg_paths[band_num] = outline_svg_path
+
+            if not inner_svg_paths or not outline_svg_paths:
+                fallback_symbol = QgsMarkerSymbol.createSimple({
+                    'name': 'square',
+                    'color': outline_color,
+                    'outline_color': outline_color,
+                    'size': '3',
+                    'size_unit': 'MM',
+                })
+                return QgsSingleSymbolRenderer(fallback_symbol)
+
+            def _expr_quote(path_value):
+                return path_value.replace('\\', '/').replace("'", "''")
+
+            def _build_file_expr(path_map):
+                cases = []
+                for band_num, (min_speed, max_speed, _color) in enumerate(S111Standards.SPEED_BANDS, start=1):
+                    svg_variant_path = path_map.get(band_num)
+                    if not svg_variant_path:
+                        continue
+                    if max_speed == float('inf'):
+                        condition = f'"Speed" >= {min_speed}'
+                    else:
+                        condition = f'"Speed" >= {min_speed} AND "Speed" < {max_speed}'
+                    cases.append(f"WHEN {condition} THEN '{_expr_quote(svg_variant_path)}'")
+                default_path = _expr_quote(next(iter(path_map.values())))
+                return "CASE " + " ".join(cases) + f" ELSE '{default_path}' END"
+
+            outline_file_expr = _build_file_expr(outline_svg_paths)
+            inner_file_expr = _build_file_expr(inner_svg_paths)
+
+            symbol = QgsMarkerSymbol()
+            if symbol.symbolLayerCount() > 0:
+                symbol.deleteSymbolLayer(0)
+
+            legend_layer = QgsSimpleMarkerSymbolLayer.create({
+                'name': 'square',
+                'color': outline_color,
+                'outline_color': outline_color,
+                'outline_width': '0.1',
+            })
+            if legend_layer is not None:
+                legend_layer.setSize(3.5)
+                legend_layer.setSizeUnit(QgsUnitTypes.RenderMillimeters)
+                legend_layer.setDataDefinedProperty(
+                    QgsSymbolLayer.PropertySize,
+                    QgsProperty.fromExpression("0")
+                )
+                symbol.appendSymbolLayer(legend_layer)
+
+            first_outline_path = next(iter(outline_svg_paths.values()))
+            outline_layer = QgsSvgMarkerSymbolLayer(first_outline_path)
+            outline_layer.setSize(0.0)
+            outline_layer.setSizeUnit(QgsUnitTypes.RenderMillimeters)
+            outline_layer.setDataDefinedProperty(
+                QgsSymbolLayer.PropertySize,
+                QgsProperty.fromExpression(outer_size_expr)
+            )
+            outline_layer.setDataDefinedProperty(
+                QgsSymbolLayer.PropertyAngle,
+                QgsProperty.fromExpression('"Direction"')
+            )
+            outline_layer.setDataDefinedProperty(
+                QgsSymbolLayer.PropertyFile,
+                QgsProperty.fromExpression(outline_file_expr)
+            )
+            symbol.appendSymbolLayer(outline_layer)
+
+            first_inner_path = next(iter(inner_svg_paths.values()))
+            inner_layer = QgsSvgMarkerSymbolLayer(first_inner_path)
+            inner_layer.setSize(0.0)
+            inner_layer.setSizeUnit(QgsUnitTypes.RenderMillimeters)
+            inner_layer.setDataDefinedProperty(
+                QgsSymbolLayer.PropertySize,
+                QgsProperty.fromExpression(inner_size_expr)
+            )
+            inner_layer.setDataDefinedProperty(
+                QgsSymbolLayer.PropertyAngle,
+                QgsProperty.fromExpression('"Direction"')
+            )
+            inner_layer.setDataDefinedProperty(
+                QgsSymbolLayer.PropertyFile,
+                QgsProperty.fromExpression(inner_file_expr)
+            )
+            symbol.appendSymbolLayer(inner_layer)
+
+            return QgsSingleSymbolRenderer(symbol)
+
+        try:
+            legacy_layer = self.uncertainty_hotspot_layers.pop(offset, None)
+            if legacy_layer and legacy_layer.isValid():
+                try:
+                    QgsProject.instance().removeMapLayer(legacy_layer.id())
+                except Exception:
+                    pass
+
+            severity_specs = [
+                ('warning', HOTSPOT_WARNING_COLOR, '0.5-1.0 kn'),
+                ('critical', HOTSPOT_CRITICAL_COLOR, '>= 1.0 kn'),
+            ]
+            required_fields = {"Error_kn", "Direction", "Speed"}
+
+            for severity_key, outline_color, severity_label in severity_specs:
+                layer_key = (offset, severity_key)
+                mask = (severity_values == severity_key)
+                layer = self.uncertainty_hotspot_layers.get(layer_key)
+                needs_rebuild = not layer or not layer.isValid()
+
+                if not needs_rebuild:
+                    existing_fields = {field.name() for field in layer.fields()}
+                    needs_rebuild = not required_fields.issubset(existing_fields)
+
+                if needs_rebuild:
+                    if layer and layer.isValid():
+                        try:
+                            QgsProject.instance().removeMapLayer(layer.id())
+                        except Exception:
+                            pass
+
+                    layer_title = f"{layer_name} ({severity_label})"
+                    layer = QgsVectorLayer("Point?crs=EPSG:4326", layer_title, "memory")
+                    provider = layer.dataProvider()
+                    provider.addAttributes([
+                        QgsField("Error_kn", QVariant.Double),
+                        QgsField("Direction", QVariant.Double),
+                        QgsField("Speed", QVariant.Double),
+                    ])
+                    layer.updateFields()
+                    layer.setRenderer(_build_hotspot_renderer(outline_color))
+                    QgsProject.instance().addMapLayer(layer)
+                    self.uncertainty_hotspot_layers[layer_key] = layer
+                else:
+                    layer.dataProvider().truncate()
+                    layer.setRenderer(_build_hotspot_renderer(outline_color))
+
+                if np.any(mask):
+                    features = []
+                    for i in np.where(mask)[0]:
+                        lon = geotransform[0] + int(x_indices[i]) * geotransform[1]
+                        lat = geotransform[3] + int(y_indices[i]) * geotransform[5]
+                        dir_val = float(directions[i]) if directions is not None else 0.0
+                        speed_val = float(speed_values[i]) if speed_values is not None else 0.0
+                        feat = QgsFeature(layer.fields())
+                        feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
+                        feat.setAttributes([float(error_values[i]), dir_val, speed_val])
+                        features.append(feat)
+                    layer.dataProvider().addFeatures(features)
+                    layer.updateExtents()
+
+                print(f"[4-Day] {offset*24}h {severity_key}: {int(np.sum(mask))} 個熱點")
+
+                layer.triggerRepaint()
+
+            self.iface.mapCanvas().refresh()
+
+        except Exception as e:
+            print(f"[4-Day] 繪製 {offset*24}h 熱點失敗: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def perform_quality_check(self):
+        """執行品質監測：比對新舊資料差異 (含偵錯訊息版)"""
+        print("=" * 50)
+        print("--- [QM] 開始執行品質檢查 ---")
+        print("=" * 50)
+        
+        # 0. 基本檢查
+        print(f"[QM] 檢查 comparison_reader: {self.comparison_reader is not None}")
+        print(f"[QM] 檢查 multi_reader: {self.multi_reader is not None}")
+        if self.multi_reader:
+            print(f"[QM] 檢查 multi_reader.current_file: {getattr(self.multi_reader, 'current_file', 'ATTRIBUTE_NOT_FOUND')}")
+        
+        if not self.comparison_reader:
+            self._comparison_raw_cache = None
+            self._remove_diff_vector_layer()
+            print("[QM] 失敗: 沒有載入比對檔案")
+            return
+        if not self.multi_reader or not self.multi_reader.current_file:
+            self._comparison_raw_cache = None
+            self._remove_diff_vector_layer()
+            print("[QM] 失敗: 沒有載入主檔案")
+            return
+            
+        # 1. 獲取當前播放的「目標時間」
+        print(f"[QM] 檢查 dlg.sliderTime: {hasattr(self.dlg, 'sliderTime')}")
+        if not hasattr(self.dlg, 'sliderTime'): 
+            print("[QM] 失敗: 找不到 sliderTime")
+            return
+            
+        current_idx = self.dlg.sliderTime.value()
+        print(f"[QM] sliderTime 值: {current_idx}")
+        print(f"[QM] master_timeline 長度: {len(self.master_timeline) if hasattr(self, 'master_timeline') and self.master_timeline else 'NONE'}")
+        
+        if not hasattr(self, 'master_timeline') or not self.master_timeline:
+            self._comparison_raw_cache = None
+            self._remove_diff_vector_layer()
+            print("[QM] 失敗: master_timeline 不存在")
+            return
+            
+        if current_idx >= len(self.master_timeline): 
+            self._comparison_raw_cache = None
+            self._remove_diff_vector_layer()
+            print("[QM] 失敗: 滑桿索引超出範圍")
+            return
+            
+        current_time = self.master_timeline[current_idx]
+        
+        print(f"[QM] 當前動畫時間: {current_time}")
+
+        # 2. 獲取當前 Reader
+        current_reader = self.multi_reader.get_current_reader()
+        if not current_reader: return
+
+        # 3. 尋找時間索引
+        main_index = None
+        comparison_index = None
+        
+        # 在主檔案找時間
+        for i, time_point in enumerate(current_reader.time_points):
+            if abs((time_point - current_time).total_seconds()) < 1800: # 30分鐘內
+                main_index = i
+                print(f"[QM] 主檔案找到對應時間，索引: {i}, 時間: {time_point}")
+                break
+        
+        # 在舊檔案找時間
+        for i, time_point in enumerate(self.comparison_reader.time_points):
+            if abs((time_point - current_time).total_seconds()) < 1800:
+                comparison_index = i
+                print(f"[QM] 舊檔案找到對應時間，索引: {i}, 時間: {time_point}")
+                break
+                
+        if main_index is None:
+            print("[QM] 警告: 主檔案在此時間點沒有資料")
+        if comparison_index is None:
+            print("[QM] 警告: 舊檔案在此時間點沒有資料")
+
+        # 4. 如果兩邊都有時間，才開始比對
+        if main_index is not None and comparison_index is not None:
+            try:
+                # 取出數據
+                main_surface = current_reader.surfaces[main_index]
+                comparison_surface = self.comparison_reader.surfaces[comparison_index]
+                
+                # 處理數據格式 (tuple vs array)
+                main_speed = main_surface[0] if isinstance(main_surface, (list, tuple)) else main_surface
+                if len(main_speed.shape) == 3: main_speed = main_speed[..., 0]
+
+                comp_speed = comparison_surface[0] if isinstance(comparison_surface, (list, tuple)) else comparison_surface
+                if len(comp_speed.shape) == 3: comp_speed = comp_speed[..., 0]
+
+                # 提取流向（若存在）
+                main_dir = None
+                comp_dir = None
+                if isinstance(main_surface, (list, tuple)) and len(main_surface) >= 2:
+                    main_dir = main_surface[1]
+                    if main_dir.ndim == 3:
+                        main_dir = main_dir[..., 0]
+                if isinstance(comparison_surface, (list, tuple)) and len(comparison_surface) >= 2:
+                    comp_dir = comparison_surface[1]
+                    if comp_dir.ndim == 3:
+                        comp_dir = comp_dir[..., 0]
+
+                print(f"[QM] 正在比對數據... 形狀: {main_speed.shape} vs {comp_speed.shape}")
+
+                # 建立遮罩：兩邊的數據都必須 > 0 (排除陸地)
+                valid_mask = (main_speed > 0) & (comp_speed > 0)
+
+                # ── 流速差異 ──────────────────────────────────
+                diff = np.zeros_like(main_speed)
+                diff[valid_mask] = np.abs(main_speed[valid_mask] - comp_speed[valid_mask])
+
+                if np.any(valid_mask):
+                    max_diff  = np.max(diff[valid_mask])
+                    mean_diff = np.mean(diff[valid_mask])
+                    print(f"[QM] 流速最大差異: {max_diff:.4f} 節  平均: {mean_diff:.4f} 節")
+                    print(f"[QM] 有效比對點數: {np.sum(valid_mask)}")
+                else:
+                    print("[QM] 警告: 沒有重疊的有效海域資料")
+                    max_diff = 0
+
+                # ── 流向差異（圓形統計）────────────────────────
+                dir_diff  = np.full(main_speed.shape, np.nan)
+                dir_valid = np.zeros(main_speed.shape, dtype=bool)
+                if main_dir is not None and comp_dir is not None:
+                    dir_valid = (valid_mask
+                                 & ~np.isnan(main_dir) & ~np.isnan(comp_dir))
+                    if np.any(dir_valid):
+                        delta_rad = np.radians(
+                            main_dir[dir_valid] - comp_dir[dir_valid])
+                        dir_diff[dir_valid] = np.degrees(
+                            np.arccos(np.clip(np.cos(delta_rad), -1.0, 1.0)))
+                        print(f"[QM] 流向最大差異: {np.nanmax(dir_diff):.1f}°  "
+                              f"平均: {np.nanmean(dir_diff[dir_valid]):.1f}°")
+
+                # 固定門檻：只保留老師確認過的流速分級。
+                if np.any(valid_mask):
+                    std_spd = np.std(diff[valid_mask])
+                else:
+                    std_spd = 0.0
+                if np.any(dir_valid):
+                    std_dir = np.std(dir_diff[dir_valid])
+                else:
+                    std_dir = float('nan')
+
+                warn_threshold_kn = HOTSPOT_WARN_KN
+                critical_threshold_kn = HOTSPOT_CRITICAL_KN
+                print(f"[QM] 固定門檻 → warning: {warn_threshold_kn:.1f} 節  "
+                      f"critical: {critical_threshold_kn:.1f} 節")
+
+                # 目前 hotspot 只依固定流速門檻標示；流向保留統計，不再做閾值旗標。
+                spd_above = (diff >= warn_threshold_kn) & valid_mask
+                dir_above = np.zeros_like(valid_mask, dtype=bool)
+                combined = spd_above
+
+                y_indices, x_indices = np.where(combined)
+                count = len(y_indices)
+                print(f"[QM] 流速異常: {np.sum(spd_above)}  合計: {count}")
+
+                # ── 寫入 Metadata 報告 ──────────────────────────────
+                if hasattr(self.dlg, 'txtMetadata'):
+                    has_dir = np.any(dir_valid)
+                    meta_lines = [
+                        "=" * 46,
+                        "  模型比對品質分析報告",
+                        "=" * 46,
+                        f"  有效比對點數 : {int(np.sum(valid_mask))}",
+                        "-" * 46,
+                        "  【流速】",
+                        f"    最大差異   : {np.max(diff[valid_mask]):.4f} 節" if np.any(valid_mask) else "    最大差異   : N/A",
+                        f"    平均差異   : {np.mean(diff[valid_mask]):.4f} 節" if np.any(valid_mask) else "    平均差異   : N/A",
+                        f"    σ          : {std_spd:.4f} 節",
+                        f"    警示門檻   : {warn_threshold_kn:.1f} 節",
+                        f"    嚴重門檻   : {critical_threshold_kn:.1f} 節",
+                        f"    熱點點數   : {int(np.sum(spd_above))}",
+                        "-" * 46,
+                        "  【流向】",
+                    ]
+                    if has_dir:
+                        meta_lines += [
+                            f"    最大差異   : {np.nanmax(dir_diff):.1f}°",
+                            f"    平均差異   : {np.nanmean(dir_diff[dir_valid]):.1f}°",
+                            f"    σ          : {std_dir:.1f}°",
+                            "    流向熱點   : 已停用（不再使用 σ 閾值）",
+                        ]
+                    else:
+                        meta_lines.append("    流向資料不可用")
+                    meta_lines += [
+                        "-" * 46,
+                        f"  流速熱點總計 : {count} 點  (固定門檻 0.5 / 1.0 節)",
+                        "=" * 46,
+                    ]
+                    self.dlg.txtMetadata.setText('\n'.join(meta_lines))
+
+                if count > 0:
+                    geotransform = current_reader.geotransform
+                    diff_values = diff[y_indices, x_indices]
+                    speed_values = comp_speed[y_indices, x_indices]
+                    main_speed_values = main_speed[y_indices, x_indices]
+
+                    # 比對層顯示 comparison/truth 這一側的流向，方便與主圖層對照
+                    if comp_dir is not None:
+                        dir_values = comp_dir[y_indices, x_indices]
+                    else:
+                        dir_values = None
+
+                    if main_dir is not None:
+                        main_dir_values = main_dir[y_indices, x_indices]
+                    else:
+                        main_dir_values = None
+
+                    self.update_difference_layer(y_indices, x_indices,
+                                                 diff_values, geotransform, dir_values,
+                                                 speed_values, main_speed_values,
+                                                 main_dir_values, True)
+                    print("[QM] 已更新異常箭頭圖層")
+                else:
+                    print("[QM] 差異未超過閾值，不顯示異常圖層")
+                    # 清空紅框
+                    self._comparison_raw_cache = None
+                    for _cl in (self.comparison_layer, self.comparison_layer_warning):
+                        if _cl:
+                            try:
+                                QgsProject.instance().removeMapLayer(_cl.id())
+                            except Exception:
+                                pass
+                    self.comparison_layer = None
+                    self.comparison_layer_warning = None
+                    self._remove_diff_vector_layer()
+
+            except Exception as e:
+                print(f"[QM] 數據處理錯誤: {e}")
+                import traceback
+                traceback.print_exc()
+            
+        else:
+            # 時間對不上
+            print("[QM] 時間未對齊，無法比對")
+            self._comparison_raw_cache = None
+            for _cl in (self.comparison_layer, self.comparison_layer_warning):
+                if _cl:
+                    try:
+                        QgsProject.instance().removeMapLayer(_cl.id())
+                    except Exception:
+                        pass
+            self.comparison_layer = None
+            self.comparison_layer_warning = None
+            self._remove_diff_vector_layer()
+
+    def _build_colored_arrow_renderer(self, outline_color):
+        """建立帶有色外框的箭頭 renderer（參考舊版簡單箭頭方式，使用 QGIS 內建箭頭符號）。
+        outline_color: 外框顏色，例如 '#FF0000' 或 '#FFD700'。
+        圖層需有 Speed, Direction 欄位。
+        使用 QGIS 內建 arrow marker（非 SVG），顏色保證正確顯示。
+        """
+        from qgis.core import QgsSingleSymbolRenderer
+
+        # 依流速動態調整大小（和主圖層相同比例）
+        base_size = 6.0
+        size_expr = f"""
+        CASE
+            WHEN "Speed" <= {S111Standards.SLOW} THEN {base_size} * {S111Standards.SCALE_FLOOR}
+            WHEN "Speed" >= {S111Standards.SHIGH} THEN {base_size} * {S111Standards.SCALE_CEILING}
+            ELSE {base_size} * ("Speed" * {S111Standards.SCALE_FACTOR_INTERMEDIATE})
+        END
+        """
+
+        symbol = QgsMarkerSymbol.createSimple({
+            'name': 'arrow',           # QGIS 內建箭頭符號（非 SVG）
+            'color': '0,0,0,0',        # 箭頭內部完全透明
+            'outline_color': outline_color,  # 外框顏色（紅或黃）
+            'outline_width': '0.8',
+            'size': str(base_size),
+            'size_unit': 'MM',
+        })
+
+        sl = symbol.symbolLayer(0)
+        # 依 Direction 欄位旋轉
+        sl.setDataDefinedProperty(
+            QgsSymbolLayer.PropertyAngle,
+            QgsProperty.fromExpression('"Direction"')
+        )
+        # 依 Speed 欄位調整大小
+        sl.setDataDefinedProperty(
+            QgsSymbolLayer.PropertySize,
+            QgsProperty.fromExpression(size_expr)
+        )
+        sl.setSizeUnit(QgsUnitTypes.RenderMillimeters)
+
+        return QgsSingleSymbolRenderer(symbol)
+
+    def _build_comparison_outline_svg_path(self, svg_path, outline_color='#FF0000'):
+        """為 comparison layer 產生帶有色外框的暫存 SVG。outline_color 可指定顏色。"""
+        import re
+        import tempfile
+
+        if not os.path.exists(svg_path):
+            return None
+
+        css = (
+            ".sl {stroke-linecap:round;stroke-linejoin:round}\n"
+            f".sCHBLK {{stroke:{outline_color}; stroke-opacity:1; stroke-width:0.8;}}\n"
+            f".fSCBN1,.fSCBN2,.fSCBN3,.fSCBN4,.fSCBN5,"
+            f".fSCBN6,.fSCBN7,.fSCBN8,.fSCBN9 "
+            f"{{fill:{outline_color}; fill-opacity:1;}}\n"
+        )
+
+        with open(svg_path, 'r', encoding='utf-8') as handle:
+            svg_raw = handle.read()
+        svg_processed = re.sub(r'<\?xml-stylesheet.*?\?>', '', svg_raw)
+        style_element = f'<style type="text/css"><![CDATA[\n{css}\n]]></style>'
+        match = re.search(r'<svg[^>]*>', svg_processed)
+        svg_final = (
+            svg_processed[:match.end()] + style_element + svg_processed[match.end():]
+            if match else style_element + svg_processed
+        )
+
+        tmp_svg = tempfile.NamedTemporaryFile(
+            mode='w', suffix='.svg', delete=False, encoding='utf-8'
+        )
+        tmp_svg.write(svg_final)
+        tmp_svg.close()
+        return tmp_svg.name
+
+    def _apply_comparison_outline(self, layer):
+        """在 comparison layer 的 S-111 箭頭外疊加有色外框。
+        Diff_Val 0.5–1.0 kn → 黃色外框；Diff_Val >= 1.0 kn → 紅色外框。
+        使用 size expression 讓兩層互斥顯示（size=0 等於隱藏）。
+        """
+        renderer = layer.renderer()
+        if not isinstance(renderer, QgsRuleBasedRenderer):
+            return
+
+        plugin_dir = os.path.dirname(os.path.abspath(__file__))
+        catalog_path = os.path.join(
+            plugin_dir, "S-111", "CATALOGUES",
+            "111_Portrayal_Catalogue_2.0.0", "PC", "XSLT", "Symbols"
+        )
+        base_size = 6.0
+        outline_margin = 1.6
+
+        # 外框 size expression：比內層箭頭大 outline_margin mm
+        def _outline_size_expr(condition):
+            return f"""
+            CASE
+                WHEN NOT ({condition}) THEN 0
+                WHEN "Speed" <= {S111Standards.SLOW} THEN ({base_size} * {S111Standards.SCALE_FLOOR}) + {outline_margin}
+                WHEN "Speed" >= {S111Standards.SHIGH} THEN ({base_size} * {S111Standards.SCALE_CEILING}) + {outline_margin}
+                ELSE ({base_size} * ("Speed" * {S111Standards.SCALE_FACTOR_INTERMEDIATE})) + {outline_margin}
+            END
+            """
+
+        # 黃色：0.5 <= |Diff_Val| < 1.0；紅色：|Diff_Val| >= 1.0
+        warn_cond = f'abs("Diff_Val") >= {HOTSPOT_WARN_KN} AND abs("Diff_Val") < {HOTSPOT_CRITICAL_KN}'
+        crit_cond = f'abs("Diff_Val") >= {HOTSPOT_CRITICAL_KN}'
+        outline_specs = [
+            (HOTSPOT_WARNING_COLOR, _outline_size_expr(warn_cond)),
+            (HOTSPOT_CRITICAL_COLOR, _outline_size_expr(crit_cond)),
+        ]
+
+        for band_num, rule in enumerate(renderer.rootRule().children(), start=1):
+            symbol = rule.symbol()
+            if symbol is None:
+                continue
+
+            svg_path = os.path.join(catalog_path, f"SCAROW{band_num:02d}.svg")
+
+            # 在 legend square (位置0) 之後、SVG 箭頭之前插入外框層（由下往上：黃、紅、箭頭）
+            insert_pos = 1
+            for outline_color, size_expr in outline_specs:
+                outline_svg_path = self._build_comparison_outline_svg_path(svg_path, outline_color)
+                if outline_svg_path is None:
+                    continue
+
+                outline_layer = QgsSvgMarkerSymbolLayer(outline_svg_path)
+                outline_layer.setSize(0.0)
+                outline_layer.setSizeUnit(QgsUnitTypes.RenderMillimeters)
+                outline_layer.setDataDefinedProperty(
+                    QgsSymbolLayer.PropertySize,
+                    QgsProperty.fromExpression(size_expr)
+                )
+                outline_layer.setDataDefinedProperty(
+                    QgsSymbolLayer.PropertyAngle,
+                    QgsProperty.fromExpression('"Direction"')
+                )
+                symbol.insertSymbolLayer(insert_pos, outline_layer)
+                insert_pos += 1
+
+        layer.triggerRepaint()
+
+    def _remove_diff_vector_layer(self):
+        """移除預報誤差向量圖層。"""
+        if self.diff_vector_layer and self.diff_vector_layer.isValid():
+            try:
+                QgsProject.instance().removeMapLayer(self.diff_vector_layer.id())
+            except Exception:
+                pass
+        self.diff_vector_layer = None
+
+    def _update_diff_vector_layer(self, y_indices, x_indices, diff_speed_values,
+                                  diff_directions, geotransform):
+        """更新預報誤差向量圖層。"""
+        layer = self.diff_vector_layer
+        required_fields = {"Speed", "Direction"}
+        needs_rebuild = not layer or not layer.isValid()
+
+        if not needs_rebuild:
+            existing_fields = {field.name() for field in layer.fields()}
+            renderer = layer.renderer()
+            needs_rebuild = (
+                not required_fields.issubset(existing_fields) or
+                not isinstance(renderer, QgsRuleBasedRenderer)
+            )
+
+        if needs_rebuild:
+            self._remove_diff_vector_layer()
+            self.diff_vector_layer = QgsVectorLayer(
+                "Point?crs=EPSG:4326", "QM: 預報誤差向量", "memory"
+            )
+            provider = self.diff_vector_layer.dataProvider()
+            provider.addAttributes([
+                QgsField("Speed", QVariant.Double),
+                QgsField("Direction", QVariant.Double),
+            ])
+            self.diff_vector_layer.updateFields()
+            self.apply_s111_standard_symbology(self.diff_vector_layer)
+            QgsProject.instance().addMapLayer(self.diff_vector_layer)
+        else:
+            provider = self.diff_vector_layer.dataProvider()
+            provider.truncate()
+
+        if len(y_indices) > 0:
+            features = []
+            for i in range(len(y_indices)):
+                y = int(y_indices[i])
+                x = int(x_indices[i])
+                lon = geotransform[0] + x * geotransform[1]
+                lat = geotransform[3] + y * geotransform[5]
+
+                feat = QgsFeature(self.diff_vector_layer.fields())
+                feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
+                feat.setAttributes([
+                    float(diff_speed_values[i]),
+                    float(diff_directions[i]),
+                ])
+                features.append(feat)
+
+            provider.addFeatures(features)
+            self.diff_vector_layer.updateExtents()
+
+        self.diff_vector_layer.triggerRepaint()
+
+    def update_difference_layer(self, y_indices, x_indices, diff_values, geotransform,
+                                directions=None, speed_values=None,
+                                main_speed_values=None, main_directions=None,
+                                show_diff_vector=True):
+        """更新差異圖層顯示。異常點以 comparison/truth 值驅動箭頭，並疊加紅色外框。"""
+        try:
+            y_indices = np.asarray(y_indices)
+            x_indices = np.asarray(x_indices)
+            diff_values = np.asarray(diff_values)
+            directions = np.asarray(directions) if directions is not None else None
+            speed_values = np.asarray(speed_values) if speed_values is not None else None
+            main_speed_values = np.asarray(main_speed_values) if main_speed_values is not None else None
+            main_directions = np.asarray(main_directions) if main_directions is not None else None
+
+            count = len(y_indices)
+            if count > 0:
+                max_speed_val = float(np.max(speed_values)) if speed_values is not None and len(speed_values) > 0 else 1.0
+                self._comparison_raw_cache = {
+                    'y_indices_full': y_indices.copy(),
+                    'x_indices_full': x_indices.copy(),
+                    'diff_values_full': diff_values.copy(),
+                    'directions_full': directions.copy() if directions is not None else None,
+                    'speed_values_full': speed_values.copy() if speed_values is not None else None,
+                    'main_speed_values_full': main_speed_values.copy() if main_speed_values is not None else None,
+                    'main_directions_full': main_directions.copy() if main_directions is not None else None,
+                    'show_diff_vector': bool(show_diff_vector),
+                    'geotransform': geotransform,
+                    'max_speed': max_speed_val,
+                }
+                # --- 抽稀演算法（暫時停用，避免稀疏的嚴重異常點被過濾掉）---
+                # step = self._calculate_strict_n(max_speed_val, geotransform)
+                #
+                # try:
+                #     canvas_extent = self.iface.mapCanvas().extent()
+                #     buffer = abs(geotransform[1]) * step * 2
+                #     lons = geotransform[0] + x_indices * geotransform[1]
+                #     lats = geotransform[3] + y_indices * geotransform[5]
+                #     in_view = (
+                #         (lons >= canvas_extent.xMinimum() - buffer) &
+                #         (lons <= canvas_extent.xMaximum() + buffer) &
+                #         (lats >= canvas_extent.yMinimum() - buffer) &
+                #         (lats <= canvas_extent.yMaximum() + buffer)
+                #     )
+                #     y_indices = y_indices[in_view]
+                #     x_indices = x_indices[in_view]
+                #     diff_values = diff_values[in_view]
+                #     if directions is not None:
+                #         directions = directions[in_view]
+                #     if speed_values is not None:
+                #         speed_values = speed_values[in_view]
+                #     if main_speed_values is not None:
+                #         main_speed_values = main_speed_values[in_view]
+                #     if main_directions is not None:
+                #         main_directions = main_directions[in_view]
+                # except Exception:
+                #     pass
+                #
+                # y_indices = y_indices[::step]
+                # x_indices = x_indices[::step]
+                # diff_values = diff_values[::step]
+                # if directions is not None:
+                #     directions = directions[::step]
+                # if speed_values is not None:
+                #     speed_values = speed_values[::step]
+                # if main_speed_values is not None:
+                #     main_speed_values = main_speed_values[::step]
+                # if main_directions is not None:
+                #     main_directions = main_directions[::step]
+                # --- 抽稀演算法結束 ---
+            else:
+                self._comparison_raw_cache = None
+
+            def _make_arrow_symbol(outline_color):
+                """建立彩色外框透明填充箭頭（和參考檔案相同方式）。"""
+                sym = QgsMarkerSymbol.createSimple({
+                    'name': 'arrow',
+                    'color': '255,255,255,0',   # 完全透明填充
+                    'outline_color': outline_color,
+                    'outline_width': '0.8',
+                    'size': '6',
+                    'size_unit': 'MM',
+                })
+                sl = sym.symbolLayer(0)
+                sl.setDataDefinedProperty(
+                    QgsSymbolLayer.PropertyAngle,
+                    QgsProperty.fromExpression('"Direction"')
+                )
+                sl.setSizeUnit(QgsUnitTypes.RenderMillimeters)
+                return sym
+
+            def _rebuild_comparison_layer(existing, name, outline_color):
+                """移除舊圖層、建立新的，套用彩色箭頭符號後加入專案。"""
+                if existing and existing.isValid():
+                    try:
+                        QgsProject.instance().removeMapLayer(existing.id())
+                    except Exception:
+                        pass
+                lyr = QgsVectorLayer("Point?crs=EPSG:4326", name, "memory")
+                prov = lyr.dataProvider()
+                prov.addAttributes([
+                    QgsField("Diff_Val", QVariant.Double),
+                    QgsField("Direction", QVariant.Double),
+                    QgsField("Speed", QVariant.Double),
+                    QgsField("Speed_Val", QVariant.Double),
+                ])
+                lyr.updateFields()
+                lyr.renderer().setSymbol(_make_arrow_symbol(outline_color))
+                QgsProject.instance().addMapLayer(lyr)
+                return lyr, lyr.dataProvider()
+
+            # 每次都重建兩個圖層，確保符號設定是最新的
+            self.comparison_layer_warning, prov_w = _rebuild_comparison_layer(
+                self.comparison_layer_warning,
+                "QM: 品質異常點 (警告 0.5-1.0kn)",
+                HOTSPOT_WARNING_COLOR,
+            )
+            self.comparison_layer, prov_c = _rebuild_comparison_layer(
+                self.comparison_layer,
+                "QM: 品質異常點 (嚴重 ≥1.0kn)",
+                HOTSPOT_CRITICAL_COLOR,
+            )
+
+            if len(y_indices) > 0:
+                print(f"[QM] 正在繪製 {len(y_indices)} 個異常箭頭...")
+                warn_features = []
+                crit_features = []
+
+                for i in range(len(y_indices)):
+                    y_i = int(y_indices[i])
+                    x_i = int(x_indices[i])
+                    val = float(diff_values[i])
+                    direction_val = float(directions[i]) if directions is not None else 0.0
+                    speed_val = float(speed_values[i]) if speed_values is not None else 0.0
+                    lon = geotransform[0] + x_i * geotransform[1]
+                    lat = geotransform[3] + y_i * geotransform[5]
+                    geom = QgsGeometry.fromPointXY(QgsPointXY(lon, lat))
+                    attrs = [val, direction_val, speed_val, speed_val]
+
+                    abs_val = abs(val)
+                    if abs_val >= HOTSPOT_CRITICAL_KN:
+                        f = QgsFeature(self.comparison_layer.fields())
+                        f.setGeometry(geom)
+                        f.setAttributes(attrs)
+                        crit_features.append(f)
+                    elif abs_val >= HOTSPOT_WARN_KN:
+                        f = QgsFeature(self.comparison_layer_warning.fields())
+                        f.setGeometry(geom)
+                        f.setAttributes(attrs)
+                        warn_features.append(f)
+
+                if warn_features:
+                    prov_w.addFeatures(warn_features)
+                    self.comparison_layer_warning.updateExtents()
+                if crit_features:
+                    prov_c.addFeatures(crit_features)
+                    self.comparison_layer.updateExtents()
+
+            if (
+                show_diff_vector and len(y_indices) > 0 and
+                speed_values is not None and directions is not None and
+                main_speed_values is not None and main_directions is not None
+            ):
+                valid_vector_mask = (
+                    ~np.isnan(speed_values) &
+                    ~np.isnan(directions) &
+                    ~np.isnan(main_speed_values) &
+                    ~np.isnan(main_directions)
+                )
+
+                if np.any(valid_vector_mask):
+                    plot_y = y_indices[valid_vector_mask]
+                    plot_x = x_indices[valid_vector_mask]
+                    plot_main_speed = main_speed_values[valid_vector_mask]
+                    plot_main_dir = main_directions[valid_vector_mask]
+                    plot_comp_speed = speed_values[valid_vector_mask]
+                    plot_comp_dir = directions[valid_vector_mask]
+
+                    u_main = plot_main_speed * np.sin(np.radians(plot_main_dir))
+                    v_main = plot_main_speed * np.cos(np.radians(plot_main_dir))
+                    u_comp = plot_comp_speed * np.sin(np.radians(plot_comp_dir))
+                    v_comp = plot_comp_speed * np.cos(np.radians(plot_comp_dir))
+
+                    u_diff = u_main - u_comp
+                    v_diff = v_main - v_comp
+                    diff_speed_mag = np.sqrt(u_diff ** 2 + v_diff ** 2)
+                    diff_dir_vals = np.degrees(np.arctan2(u_diff, v_diff)) % 360.0
+
+                    self._update_diff_vector_layer(
+                        plot_y,
+                        plot_x,
+                        diff_speed_mag,
+                        diff_dir_vals,
+                        geotransform,
+                    )
+                else:
+                    self._remove_diff_vector_layer()
+            else:
+                self._remove_diff_vector_layer()
+
+            if self.comparison_layer_warning:
+                self.comparison_layer_warning.triggerRepaint()
+            if self.comparison_layer:
+                self.comparison_layer.triggerRepaint()
+            self.iface.mapCanvas().refresh()
+            print("[QM] 比對異常箭頭繪製完成（黃色警告 / 紅色嚴重）")
+
+        except Exception as e:
+            print(f"[QM] 繪製失敗: {e}")
+            import traceback
+            traceback.print_exc()
     
     # --- NEW: Core logic function to filter the timeline and update the slider ---
     def update_time_range(self):
         """
         Generates the Master Timeline based on user input with configurable intervals.
         Displays data conditionally based on availability in the Data Timeline.
+        Also supports S-104-only scenario (no S-111 loaded).
         """
-        if not self.multi_reader or not self.multi_reader.global_timeline:
+        has_s111_timeline = self.multi_reader and self.multi_reader.global_timeline
+        has_s104_timeline = (self.bathymetry_manager is not None
+                            and len(getattr(self.bathymetry_manager, 's104_sorted_times', [])) > 0)
+
+        if not has_s111_timeline and not has_s104_timeline:
             return
 
         # Get the start and end times from the UI
@@ -1304,19 +3547,17 @@ class S111Viewer:
 
         # Get the selected animation interval from dropdown
         from datetime import timedelta
-        interval_text = "60分鐘"  # Default value
+        interval_text = "60 min"  # Default value
         if hasattr(self.dlg, 'comboBox'):
             interval_text = self.dlg.comboBox.currentText()
-        
-        # Convert Chinese text to timedelta
-        interval_map = {
-            "15分鐘": timedelta(minutes=15),
-            "30分鐘": timedelta(minutes=30),
-            "45分鐘": timedelta(minutes=45),
-            "60分鐘": timedelta(minutes=60)
-        }
-        
-        interval = interval_map.get(interval_text, timedelta(minutes=60))
+
+        # 從文字中提取數字，支援 "15 min" / "15分鐘" 等格式
+        import re
+        minutes_match = re.search(r'(\d+)', interval_text)
+        if minutes_match:
+            interval = timedelta(minutes=int(minutes_match.group(1)))
+        else:
+            interval = timedelta(minutes=60)
         
         self.master_timeline = []
         current_t = start_dt
@@ -1347,7 +3588,7 @@ class S111Viewer:
         else:
             # If no time points are generated, disable the slider and clear the layer
             self.dlg.sliderTime.setEnabled(False)
-            if self.flow_layer:
+            if hasattr(self, 'flow_layer') and self.flow_layer:
                 self.flow_layer.dataProvider().truncate()
                 self.flow_layer.triggerRepaint()
 
@@ -1443,7 +3684,7 @@ class S111Viewer:
             
             # 添加一些基本的元數據信息
             if hasattr(reader, 'metadata') and reader.metadata:
-                key_fields = ['productSpecification', 'issueDate', 'issueTime', 
+                key_fields = ['productSpecification', 
                              'eastBoundLongitude', 'westBoundLongitude', 
                              'northBoundLatitude', 'southBoundLatitude']
                 
@@ -1461,22 +3702,66 @@ class S111Viewer:
             return f"無法獲取元數據: {e}"
 
     def remove_selected_file(self):
-        """移除選擇的檔案"""
-        if hasattr(self.dlg, 'fileListWidget'):
-            current_item = self.dlg.fileListWidget.currentItem()
-            if current_item and self.multi_reader:
-                filepath = current_item.data(Qt.UserRole)
-                self.multi_reader.remove_file(filepath)
-                self.update_file_list()
-                
-                # 如果還有檔案，載入新的當前檔案
-                if self.multi_reader.file_list:
-                    self.load_current_file()
-                else:
-                    # 沒有檔案了，清空顯示
-                    self.clear_layers()
-                    if hasattr(self.dlg, 'txtMetadata'):
-                        self.dlg.txtMetadata.clear()
+        """移除 Loaded Files 列表中選取的單一檔案"""
+        if not hasattr(self.dlg, 'fileListWidget') or not self.multi_reader:
+            return
+
+        current_item = self.dlg.fileListWidget.currentItem()
+        if not current_item:
+            print("[Remove] 未選取任何檔案")
+            return
+
+        filepath = current_item.data(Qt.UserRole)
+        if not filepath:
+            return
+
+        try:
+            import os
+            print(f"[Remove] 移除檔案: {os.path.basename(filepath)}")
+
+            # 1. 如果動畫正在播放，先停止
+            if self.animation_timer and self.animation_timer.isActive():
+                self.animation_timer.stop()
+
+            # 2. 從 multi_reader 中移除 (會重建 global_timeline)
+            self.multi_reader.remove_file(filepath)
+
+            # 3. 更新檔案列表 UI
+            self.update_file_list()
+
+            # 4. 根據剩餘檔案數量決定後續動作
+            if self.multi_reader.file_list:
+                # 還有檔案：重建 master_timeline 和 slider 範圍
+                if self.multi_reader.global_timeline:
+                    first_time = self.multi_reader.global_timeline[0]
+                    last_time = self.multi_reader.global_timeline[-1]
+                    qt_first = QDateTime(first_time)
+                    qt_last = QDateTime(last_time)
+                    if hasattr(self.dlg, 'dtStartTime'):
+                        self.dlg.dtStartTime.setDateTime(qt_first)
+                    if hasattr(self.dlg, 'dtEndTime'):
+                        self.dlg.dtEndTime.setDateTime(qt_last)
+
+                # 重建 master_timeline 與 slider
+                self.update_time_range()
+
+                # 顯示第一幀
+                if hasattr(self.dlg, 'sliderTime'):
+                    self.dlg.sliderTime.setValue(0)
+            else:
+                # 沒有檔案了，清空一切
+                self.master_timeline = []
+                if hasattr(self.dlg, 'sliderTime'):
+                    self.dlg.sliderTime.setMaximum(0)
+                    self.dlg.sliderTime.setValue(0)
+                self.clear_layers()
+                if hasattr(self.dlg, 'txtMetadata'):
+                    self.dlg.txtMetadata.clear()
+
+        except Exception as e:
+            print(f"[Remove] 移除檔案時出錯: {e}")
+            import traceback
+            traceback.print_exc()
 
     def clear_all_files(self):
         """清除所有檔案"""
@@ -1492,22 +3777,13 @@ class S111Viewer:
     def load_current_file(self):
         """載入當前選擇的檔案並建立一個固定的圖層來顯示數據"""
         if not self.multi_reader or not self.multi_reader.current_file:
-            print("錯誤: 沒有選擇檔案")
             return
             
         try:
             current_reader = self.multi_reader.get_current_reader()
-            if not current_reader:
-                print("錯誤: 無法獲取當前讀取器")
-                return
+            if not current_reader: return
             
-            # This logic is now handled by update_time_range, so we simplify this function
-            # The main goal here is to ensure the persistent layer is set up.
-                
-            # 載入新檔案前，先清除舊的固定圖層 (if any)
-            self.clear_layers()
-            
-            # 建立一個固定的向量圖層 (只做一次)
+            # 建立固定圖層
             self.setup_persistent_layer()
 
             # 如果圖層成功建立
@@ -1515,17 +3791,95 @@ class S111Viewer:
                 # 更新元數據顯示
                 if hasattr(self.dlg, 'txtMetadata'):
                     self.dlg.txtMetadata.setText(current_reader.get_metadata_text())
-                    
-                # The first display update is now triggered by update_time_range
                 
-                # 縮放到圖層範圍
-                self.iface.mapCanvas().setExtent(self.flow_layer.extent())
+                # 應用 S-111 符號
+                self.apply_s111_standard_symbology(self.flow_layer)
+
+                # ==================== [修正開始] ====================
+                # 因為加入了 Viewport Clipping，我們必須先手動縮放到檔案範圍
+                # 否則 Viewport 在錯誤位置時，會產生 0 個點，導致無法自動縮放
+                try:
+                    from qgis.core import QgsRectangle
+                    
+                    # 嘗試從 reader 的地理參考資訊計算範圍
+                    gt = current_reader.geotransform
+                    if gt and len(current_reader.surfaces) > 0:
+                        # 取得第一幀數據的形狀
+                        # surfaces[0] 是 (speed, direction)
+                        data_shape = current_reader.surfaces[0][0].shape
+                        
+                        if len(data_shape) >= 2: # Type 2 Grid
+                            height, width = data_shape[0], data_shape[1]
+                        else: # Type 3 Point or 1D
+                            height, width = 1, data_shape[0]
+                            
+                        # 計算邊界: [min_lon, res_x, 0, max_lat, 0, res_y]
+                        min_x = gt[0]
+                        max_y = gt[3]
+                        max_x = min_x + (width * gt[1])
+                        min_y = max_y + (height * gt[5]) # gt[5] 通常是負的
+                        
+                        # 建立範圍矩形 (注意 QgsRectangle 需要 xmin, ymin, xmax, ymax)
+                        # 確保 min < max
+                        final_xmin = min(min_x, max_x)
+                        final_xmax = max(min_x, max_x)
+                        final_ymin = min(min_y, max_y)
+                        final_ymax = max(min_y, max_y)
+                        
+                        extent = QgsRectangle(final_xmin, final_ymin, final_xmax, final_ymax)
+                        
+                        # 強制視窗縮放到這個範圍
+                        self.iface.mapCanvas().setExtent(extent)
+                        self.iface.mapCanvas().refresh()
+                        print(f"已強制縮放到檔案範圍: {extent.toString()}")
+                        
+                except Exception as e:
+                    print(f"自動縮放計算失敗: {e}")
+                # ==================== [修正結束] ====================
+
+                # 第一次顯示數據 (現在視窗位置對了，這行就能畫出東西了！)
+                if hasattr(self.dlg, 'sliderTime'):
+                     self.update_time_display(self.dlg.sliderTime.value())
+                
+                # 確保刷新
                 self.iface.mapCanvas().refresh()
 
         except Exception as e:
             print(f"載入檔案時出錯: {e}")
-            print(traceback.format_exc())
+            import traceback
+            traceback.print_exc()
             self.log_error(f'載入當前檔案時發生錯誤: {str(e)}')
+
+
+    def setup_metadata_widget(self):
+        """設置元數據顯示控件"""
+        if not hasattr(self.dlg, 'txtMetadata'):
+            from qgis.PyQt.QtWidgets import QVBoxLayout, QTextEdit
+            
+            # 確保 groupMetadata 有佈局
+            if not self.dlg.groupMetadata.layout():
+                layout = QVBoxLayout(self.dlg.groupMetadata)
+                layout.setContentsMargins(5, 5, 5, 5)  # 設置邊距
+            else:
+                layout = self.dlg.groupMetadata.layout()
+            
+            # 創建元數據文字顯示控件
+            self.dlg.txtMetadata = QTextEdit(self.dlg.groupMetadata)
+            self.dlg.txtMetadata.setReadOnly(True)
+            self.dlg.txtMetadata.setMaximumHeight(150)
+            self.dlg.txtMetadata.setMinimumHeight(100)
+            self.dlg.txtMetadata.setPlaceholderText("Select an S-102/S-104/S-111 file to view detailed metadata...")
+            
+            # 設置字體和樣式
+            font = self.dlg.txtMetadata.font()
+            font.setFamily("Courier New")
+            font.setPointSize(9)
+            self.dlg.txtMetadata.setFont(font)
+            
+            # 添加到佈局
+            layout.addWidget(self.dlg.txtMetadata)
+            
+            print("✅ 已動態創建 txtMetadata 控件")
 
     def analyze_file(self):
         """分析當前選擇的 HDF5 文件"""
@@ -1571,18 +3925,30 @@ class S111Viewer:
         """
         建立一個固定的、可重複使用的全局向量圖層。
         這個圖層將作為"舞台"，動態顯示來自不同檔案的數據。
+        Single Layer Policy: 永遠只維護一個 flow_layer。
         """
         # 使用一個通用的、有意義的圖層名稱
         layer_name = "S111 Global Flow Data"
-        
-        # 檢查圖層是否已存在，避免重複創建
-        if self.layer_exists(layer_name):
-            # 如果已存在，獲取它的引用
-            existing_layers = QgsProject.instance().mapLayersByName(layer_name)
-            if existing_layers:
-                self.flow_layer = existing_layers[0]
-                print(f"已找到現有的固定圖層: {layer_name}")
-                return
+
+        # 如果已持有有效的 flow_layer 引用，直接複用
+        if self.flow_layer and self.flow_layer.isValid():
+            # 確保名稱一致（修正舊版動態改名的殘留）
+            if self.flow_layer.name() != layer_name:
+                self.flow_layer.setName(layer_name)
+            print(f"複用現有 flow_layer: {layer_name}")
+            return
+
+        # 檢查圖層是否已存在於 project 中（例如插件 reload 後）
+        existing_layers = QgsProject.instance().mapLayersByName(layer_name)
+        if existing_layers:
+            self.flow_layer = existing_layers[0]
+            print(f"已找到現有的固定圖層: {layer_name}")
+            return
+
+        # 同時清理可能殘留的舊命名圖層 (S111 Flow (Source: ...))
+        for layer in list(QgsProject.instance().mapLayers().values()):
+            if layer.name().startswith("S111 Flow (Source:"):
+                QgsProject.instance().removeMapLayer(layer.id())
 
         # 創建臨時向量圖層
         self.flow_layer = QgsVectorLayer("Point?crs=EPSG:4326", layer_name, "memory")
@@ -1613,10 +3979,7 @@ class S111Viewer:
         self.flow_layer.dataProvider().addAttributes(fields)
         self.flow_layer.updateFields()
         
-        # 設置符號系統
-        self.apply_s111_standard_symbology(self.flow_layer)
-        
-        # 添加到項目
+        # 添加到項目 (符號系統會在特徵加載後應用)
         QgsProject.instance().addMapLayer(self.flow_layer)
         print(f"已成功建立固定的全局圖層: {layer_name}")
 
@@ -1631,295 +3994,183 @@ class S111Viewer:
         self.iface.mapCanvas().setExtent(self.flow_layer.extent())
         self.iface.mapCanvas().refresh()
 
-    def apply_s111_standard_symbology(self, layer):
-        """應用 S-111 標準符號設置到圖層"""
+    def apply_s111_standard_symbology(self, layer, suppress_border_stroke=False):
+        """
+        應用 S-111 標準符號設置到圖層
+        [雙層符號策略]
+        1. 圖例 (Legend): 顯示固定大小的方形色塊 (避免圖例過大)
+        2. 地圖 (Map): 顯示動態大小的 SVG 箭頭 (依據 S-111 H-5 規範公式)
+        suppress_border_stroke: 若為 True，抑制 .sCHBLK 黑色外框（用於比對圖層，讓有色外框可見）
+        """
         try:
-            print(f"開始應用 S-111 標準符號到圖層: {layer.name()}")
+            import os
+            import tempfile
+            import re
             
-            # 檢查圖層是否有效
+            # 引入需要的 QGIS 核心類別
+            from qgis.core import (
+                QgsRuleBasedRenderer, 
+                QgsSvgMarkerSymbolLayer, 
+                QgsSimpleMarkerSymbolLayer,
+                QgsSymbolLayer, 
+                QgsMarkerSymbol,
+                QgsProperty,
+                QgsUnitTypes
+            )
+            
+            # 1. 基本檢查
             if not layer or not layer.isValid():
-                print("錯誤: 圖層無效，無法應用符號")
                 return
-                
-            # 檢查圖層是否有特徵
-            feature_count = layer.featureCount()
-            print(f"圖層特徵數量: {feature_count}")
+
+            # 2. 決定目前的顯示模式 (Day/Dusk/Night)
+            mode = "day"
+            if hasattr(self.dlg, 'cmbDisplayMode'):
+                mode = self.dlg.cmbDisplayMode.currentText().lower()
             
-            if feature_count == 0:
-                print("警告: 圖層沒有特徵，符號可能不會顯示")
+            print(f"應用 S-111 符號 (模式: {mode}, 雙層策略): {layer.name()}")
             
-            # 使用規則化渲染器來根據速度選擇不同的符號
-            from qgis.core import QgsRuleBasedRenderer, QgsSvgMarkerSymbolLayer, QgsSymbolLayer
+            # 3. 準備路徑 (S-111 目錄結構)
+            plugin_dir = os.path.dirname(os.path.abspath(__file__))
+            catalog_path = os.path.join(plugin_dir, "S-111", "CATALOGUES", "111_Portrayal_Catalogue_2.0.0", "PC", "XSLT", "Symbols")
             
-            # 創建規則化渲染器
+            # 讀取 CSS 樣式表
+            css_filename = f"SVGStyle_S111{mode}.css"
+            css_path = os.path.join(catalog_path, css_filename)
+            css_content = ""
+            
+            if os.path.exists(css_path):
+                with open(css_path, 'r', encoding='utf-8') as f:
+                    css_content = f.read()
+            else:
+                # 若找不到指定模式，回退到日間模式
+                fallback = os.path.join(catalog_path, "SVGStyle_S111day.css")
+                if os.path.exists(fallback):
+                    with open(fallback, 'r', encoding='utf-8') as f:
+                        css_content = f.read()
+
+            # 比對圖層：抑制 sCHBLK 黑色外框，讓下層有色外框可見
+            if suppress_border_stroke:
+                css_content += "\n.sCHBLK {stroke:none; stroke-opacity:0;}"
+
+            # 4. 建立渲染規則 (Rule-based Renderer)
             root_rule = QgsRuleBasedRenderer.Rule(None)
-            
-            # 獲取速度帶定義
             speed_bands = S111Standards.SPEED_BANDS
-            print(f"將創建 {len(speed_bands)} 個速度帶的符號")
+            
+            # [參數設定] 基準大小 (Base Size)
+            # S-111 建議 10mm，但為了 QGIS 顯示美觀，我們設為 6.0mm
+            BASE_SIZE = 6.0 
             
             for i, (min_speed, max_speed, color) in enumerate(speed_bands):
                 band_num = i + 1
                 
-                # 嘗試創建獨立的 SVG 符號（不依賴外部 CSS）
-                svg_content = self.create_independent_svg_symbol(color, S111Standards.BORDER_COLOR, S111Standards.BORDER_WIDTH)
+                # 準備 SVG 路徑
+                svg_filename = f"SCAROW{band_num:02d}.svg"
+                svg_path = os.path.join(catalog_path, svg_filename)
                 
-                use_svg = False
-                if svg_content:
+                # 建立複合符號 (Composite Symbol)
+                symbol = QgsMarkerSymbol()
+                if symbol.symbolLayerCount() > 0:
+                    symbol.deleteSymbolLayer(0)
+
+                # ----------------------------------------------------
+                # [第一層] 圖例專用：方形色塊 (Simple Marker)
+                # ----------------------------------------------------
+                legend_layer = QgsSimpleMarkerSymbolLayer.create({
+                    'name': 'square',       # 形狀：方形
+                    'color': color,         # 顏色：對應流速帶
+                    'outline_color': 'black',
+                    'outline_width': '0.1'
+                })
+                # 設定圖例顯示的大小 (例如 3.5mm，讓圖層面板整齊)
+                legend_layer.setSize(3.5)
+                legend_layer.setSizeUnit(QgsUnitTypes.RenderMillimeters)
+                
+                # 【關鍵】在地圖上隱藏此層 (大小設為 0)
+                legend_layer.setDataDefinedProperty(
+                    QgsSymbolLayer.PropertySize, 
+                    QgsProperty.fromExpression("0") 
+                )
+                symbol.appendSymbolLayer(legend_layer)
+
+                # ----------------------------------------------------
+                # [第二層] 地圖專用：SVG 箭頭 (SVG Marker)
+                # ----------------------------------------------------
+                if os.path.exists(svg_path):
                     try:
-                        # 創建臨時 SVG 檔案
-                        import tempfile
-                        with tempfile.NamedTemporaryFile(mode='w', suffix='.svg', delete=False) as temp_svg:
-                            temp_svg.write(svg_content)
-                            temp_svg_path = temp_svg.name
+                        # 動態注入 CSS (解決黑色箭頭問題 - Attribute Injection)
+                        with open(svg_path, 'r', encoding='utf-8') as f:
+                            svg_raw = f.read()
                         
-                        # 創建 SVG 符號
-                        symbol = QgsMarkerSymbol()
-                        symbol.deleteSymbolLayer(0)  # 移除默認符號層
+                        svg_processed = re.sub(r'<\?xml-stylesheet.*?\?>', '', svg_raw)
+                        style_element = f'<style type="text/css"><![CDATA[\n{css_content}\n]]></style>'
                         
-                        # 添加 SVG 符號層
-                        svg_layer = QgsSvgMarkerSymbolLayer(temp_svg_path)
+                        match = re.search(r'<svg[^>]*>', svg_processed)
+                        if match:
+                            insert_pos = match.end()
+                            svg_final = svg_processed[:insert_pos] + style_element + svg_processed[insert_pos:]
+                        else:
+                            svg_final = style_element + svg_processed
+
+                        tmp_svg = tempfile.NamedTemporaryFile(mode='w', suffix='.svg', delete=False, encoding='utf-8')
+                        tmp_svg.write(svg_final)
+                        tmp_svg.close()
                         
-                        # 設置 SVG 大小 (使用 S-111 標準計算)
+                        # 建立 SVG 層
+                        map_layer = QgsSvgMarkerSymbolLayer(tmp_svg.name)
+                        
+                        # 【關鍵】在圖例中隱藏此層 (預設大小設為 0)
+                        map_layer.setSize(0.0) 
+                        map_layer.setSizeUnit(QgsUnitTypes.RenderMillimeters)
+                        
+                        # 在地圖上應用 S-111 H-5 動態大小公式
+                        # 0.40 = 2.0/5.0 (S_low/S_ref)
+                        # 2.60 = 13.0/5.0 (S_high/S_ref)
+                        # 0.20 = 1/5.0 (1/S_ref)
                         size_expr = f"""
-                        CASE
-                            WHEN "Speed" <= {S111Standards.SLOW} THEN {S111Standards.HREF} * ("Speed" / {S111Standards.SLOW})
-                            WHEN "Speed" >= {S111Standards.SHIGH} THEN {S111Standards.HREF} * ("Speed" / {S111Standards.SREF})
-                            ELSE {S111Standards.HREF}
+                        CASE 
+                            WHEN "Speed" <= {S111Standards.SLOW} THEN {BASE_SIZE} * {S111Standards.SCALE_FLOOR}
+                            WHEN "Speed" >= {S111Standards.SHIGH} THEN {BASE_SIZE} * {S111Standards.SCALE_CEILING}
+                            ELSE {BASE_SIZE} * ("Speed" * {S111Standards.SCALE_FACTOR_INTERMEDIATE})
                         END
                         """
-                        size_prop = QgsProperty.fromExpression(size_expr)
-                        svg_layer.setDataDefinedProperty(QgsSymbolLayer.PropertySize, size_prop)
-                        svg_layer.setSizeUnit(QgsUnitTypes.RenderMillimeters)
+                        map_layer.setDataDefinedProperty(
+                            QgsSymbolLayer.PropertySize, 
+                            QgsProperty.fromExpression(size_expr)
+                        )
                         
-                        # 設置旋轉角度 (S-111 標準：真北為0度，順時針為正)
-                        angle_prop = QgsProperty.fromExpression('"Direction"')
-                        svg_layer.setDataDefinedProperty(QgsSymbolLayer.PropertyAngle, angle_prop)
+                        # 設定旋轉方向
+                        map_layer.setDataDefinedProperty(
+                            QgsSymbolLayer.PropertyAngle, 
+                            QgsProperty.fromExpression('"Direction"')
+                        )
                         
-                        # 設置默認大小
-                        svg_layer.setSize(8.0)  # 默認 8mm
+                        symbol.appendSymbolLayer(map_layer)
                         
-                        symbol.appendSymbolLayer(svg_layer)
-                        use_svg = True
-                        
-                        print(f"成功創建速度帶 {band_num} 的獨立 SVG 符號，顏色: {color}")
-                        
-                    except Exception as svg_error:
-                        print(f"獨立 SVG 符號創建失敗，使用自定義箭頭: {svg_error}")
-                        use_svg = False
-                        # 清理臨時檔案
-                        try:
-                            os.unlink(temp_svg_path)
-                        except:
-                            pass
-                
-                if not use_svg:
-                    # 使用自定義箭頭符號，可完全控制顏色和邊框
-                    symbol = QgsMarkerSymbol.createSimple({
-                        'name': 'arrow',
-                        'color': color,  # 使用 S-111 規範顏色
-                        'outline_color': S111Standards.BORDER_COLOR,  # 黑色邊框
-                        'outline_width': str(S111Standards.BORDER_WIDTH),  # 使用極細邊框寬度
-                        'outline_width_unit': 'MM',
-                        'size': '8',
-                        'size_unit': 'MM'
-                    })
-                    
-                    # 設置動態大小 (根據 S-111 標準)
-                    size_expr = f"""
-                    CASE
-                        WHEN "Speed" <= {S111Standards.SLOW} THEN {S111Standards.HREF} * ("Speed" / {S111Standards.SLOW})
-                        WHEN "Speed" >= {S111Standards.SHIGH} THEN {S111Standards.HREF} * ("Speed" / {S111Standards.SREF})
-                        ELSE {S111Standards.HREF}
-                    END
-                    """
-                    symbol.symbolLayer(0).setDataDefinedProperty(
-                        QgsSymbolLayer.PropertySize, 
-                        QgsProperty.fromExpression(size_expr)
-                    )
-                    
-                    # 設置動態旋轉角度 (S-111 標準：真北為0度，順時針為正)
-                    # QGIS 箭頭默認朝上，需要調整角度
-                    symbol.symbolLayer(0).setDataDefinedProperty(
-                        QgsSymbolLayer.PropertyAngle, 
-                        QgsProperty.fromExpression('"Direction"')
-                    )
-                    
-                    print(f"成功創建速度帶 {band_num} 的自定義箭頭符號，顏色: {color}")
-                
-                # 創建規則表達式
-                if max_speed == float('inf'):
-                    rule_expr = f'"Speed" >= {min_speed}'
-                    max_label = "∞"
-                else:
-                    rule_expr = f'"Speed" >= {min_speed} AND "Speed" < {max_speed}'
-                    max_label = str(max_speed)
-                
-                # 創建並添加規則
-                rule = QgsRuleBasedRenderer.Rule(
-                    symbol, 
-                    0, 
-                    0, 
-                    rule_expr, 
-                    f'速度帶 {band_num} ({min_speed}-{max_label} 節) - {color}'
-                )
-                root_rule.appendChild(rule)
-                
-                print(f"已添加速度帶 {band_num}: {min_speed}-{max_label} 節，顏色: {color}")
-            
-            # 如果成功創建了規則，應用規則化渲染器
-            if root_rule.children():
-                renderer = QgsRuleBasedRenderer(root_rule)
-                layer.setRenderer(renderer)
-                
-                # 觸發重繪
-                layer.triggerRepaint()
-                print(f"成功應用 S-111 標準符號系統，共 {len(root_rule.children())} 個速度帶")
-                print("所有符號均包含極細黑色邊框，主要顏色清楚可見")
-            else:
-                print("未能創建任何有效的符號規則，使用備用方案")
-                self.apply_simple_arrow_symbology(layer)
-                
-        except Exception as e:
-            print(f"應用 S-111 標準符號時出錯: {e}")
-            print(traceback.format_exc())
-            # 使用簡單符號作為備用
-            self.apply_simple_arrow_symbology(layer)
-    
-    def create_independent_svg_symbol(self, fill_color, stroke_color, stroke_width):
-        """創建不依賴外部 CSS 的獨立 SVG 符號
-        
-        Args:
-            fill_color (str): 填充顏色 (十六進制)
-            stroke_color (str): 邊框顏色 (十六進制)
-            stroke_width (float): 邊框寬度 (mm)
-            
-        Returns:
-            str: SVG 內容字符串
-        """
-        try:
-            # 基於官方 S-111 箭頭路徑的獨立 SVG
-            svg_content = f'''<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" version="1.2" baseProfile="tiny" xml:space="preserve" 
-     style="shape-rendering:geometricPrecision; fill-rule:evenodd;" 
-     width="6mm" height="11mm" viewBox="-3 -5.5 6 11">
-<title>S111 Arrow Symbol</title>
-<desc>Surface Current Vector - Independent SVG</desc>
-<path d="M 0,5 L -0.5,5 L -1.0,-1.5 L -2.0,-1.5 L 0,-5 L 2.0,-1.5 L 1.0,-1.5 L 0.5,5 L 0,5 Z" 
-      fill="{fill_color}" 
-      stroke="{stroke_color}" 
-      stroke-width="{stroke_width}"
-      stroke-linecap="round" 
-      stroke-linejoin="round"/>
-</svg>'''
-            return svg_content
-        except Exception as e:
-            print(f"創建獨立 SVG 符號時出錯: {e}")
-            return None
+                    except Exception as err:
+                        print(f"SVG 處理失敗: {err}")
 
-    def apply_simple_arrow_symbology(self, layer):
-        """應用簡單的箭頭符號（備用方案）- 符合 S-111 規範"""
-        try:
-            # 使用規則化渲染器以支援不同速度帶的顏色
-            from qgis.core import QgsRuleBasedRenderer
-            
-            root_rule = QgsRuleBasedRenderer.Rule(None)
-            
-            # 為每個速度帶創建規則
-            for i, (min_speed, max_speed, color) in enumerate(S111Standards.SPEED_BANDS):
-                band_num = i + 1
-                
-                # 創建符合 S-111 規範的箭頭符號
-                symbol = QgsMarkerSymbol.createSimple({
-                    'name': 'arrow',
-                    'color': color,  # 使用 S-111 規範顏色
-                    'outline_color': S111Standards.BORDER_COLOR,  # 黑色邊框
-                    'outline_width': str(S111Standards.BORDER_WIDTH),  # 使用極細邊框寬度
-                    'outline_width_unit': 'MM',
-                    'size': '8',  # 默認大小
-                    'size_unit': 'MM'
-                })
-                
-                # 設置動態大小 (根據 S-111 標準計算)
-                size_expr = f"""
-                CASE
-                    WHEN "Speed" <= {S111Standards.SLOW} THEN {S111Standards.HREF} * ("Speed" / {S111Standards.SLOW})
-                    WHEN "Speed" >= {S111Standards.SHIGH} THEN {S111Standards.HREF} * ("Speed" / {S111Standards.SREF})
-                    ELSE {S111Standards.HREF}
-                END
-                """
-                symbol.symbolLayer(0).setDataDefinedProperty(
-                    QgsSymbolLayer.PropertySize, 
-                    QgsProperty.fromExpression(size_expr)
-                )
-                
-                # 設置動態旋轉角度 (S-111 標準：真北為0度，順時針為正)
-                symbol.symbolLayer(0).setDataDefinedProperty(
-                    QgsSymbolLayer.PropertyAngle, 
-                    QgsProperty.fromExpression('"Direction"')
-                )
-                
-                # 創建規則表達式
+                # 5. 設定過濾規則 (Filter)
                 if max_speed == float('inf'):
-                    rule_expr = f'"Speed" >= {min_speed}'
-                    max_label = "∞"
+                    label = f'> {min_speed} kn'
+                    filter_exp = f'"Speed" >= {min_speed}'
                 else:
-                    rule_expr = f'"Speed" >= {min_speed} AND "Speed" < {max_speed}'
-                    max_label = str(max_speed)
-                
-                # 創建並添加規則
-                rule = QgsRuleBasedRenderer.Rule(
-                    symbol, 
-                    0, 
-                    0, 
-                    rule_expr, 
-                    f'速度帶 {band_num} ({min_speed}-{max_label} 節) - {color}'
-                )
+                    label = f'{min_speed} - {max_speed} kn'
+                    filter_exp = f'"Speed" >= {min_speed} AND "Speed" < {max_speed}'
+
+                rule = QgsRuleBasedRenderer.Rule(symbol, 0, 0, filter_exp, label)
                 root_rule.appendChild(rule)
-                
-                print(f"備用方案: 已添加速度帶 {band_num}，顏色: {color}")
-            
-            # 應用規則化渲染器
+
+            # 6. 應用到圖層
             if root_rule.children():
                 renderer = QgsRuleBasedRenderer(root_rule)
                 layer.setRenderer(renderer)
-                
-                # 觸發重繪
                 layer.triggerRepaint()
-                print("成功應用備用箭頭符號（符合 S-111 規範的顏色和黑色邊框）")
-            else:
-                # 最後的備用方案：單一符號
-                symbol = QgsMarkerSymbol.createSimple({
-                    'name': 'arrow',
-                    'color': S111Standards.SPEED_BANDS[4][2],  # 使用中等速度的顏色
-                    'outline_color': S111Standards.BORDER_COLOR,  # 黑色邊框
-                    'outline_width': str(S111Standards.BORDER_WIDTH),  # 使用極細邊框寬度
-                    'outline_width_unit': 'MM',
-                    'size': '8',
-                    'size_unit': 'MM'
-                })
-                
-                # 設置基本大小和方向
-                symbol.symbolLayer(0).setDataDefinedProperty(
-                    QgsSymbolLayer.PropertySize, 
-                    QgsProperty.fromExpression('"Speed" * 2')
-                )
-                symbol.symbolLayer(0).setDataDefinedProperty(
-                    QgsSymbolLayer.PropertyAngle, 
-                    QgsProperty.fromExpression('"Direction"')
-                )
-                
-                # 應用渲染器
-                renderer = QgsSingleSymbolRenderer(symbol)
-                layer.setRenderer(renderer)
-                
-                # 觸發重繪
-                layer.triggerRepaint()
-                print("應用最基本的備用箭頭符號（包含黑色邊框）")
+                print("✅ 符號系統設定完成 (符合 S-111 規範)")
             
         except Exception as e:
-            print(f"應用簡單箭頭符號時出錯: {e}")
-            print(traceback.format_exc())
+            print(f"apply_s111_standard_symbology 發生錯誤: {e}")
+            import traceback
+            traceback.print_exc()
 
     def start_animation(self):
         """開始播放動畫"""
@@ -1965,18 +4216,21 @@ class S111Viewer:
             self.dlg.btnPause.setEnabled(False)
         
     def stop_animation(self):
-        """停止動畫並重置"""
+        """停止動畫並重置，同時清除圖層"""
         print("停止動畫函數被調用")
-        
+
         if self.animation_timer:
             self.animation_timer.stop()
             print("動畫計時器已停止")
-        
+
         # 重置到第一幀
         if hasattr(self.dlg, 'sliderTime') and self.dlg.sliderTime.maximum() >= 0:
             print("重置到第一幀")
             self.dlg.sliderTime.setValue(0)
-            
+
+        # 清除插件管理的所有圖層
+        self.clear_layers()
+
         # 啟用播放按鈕
         if hasattr(self.dlg, 'btnPlay'):
             self.dlg.btnPlay.setEnabled(True)
@@ -2006,177 +4260,169 @@ class S111Viewer:
             # 循環播放
             print("重置到第一幀")
             self.dlg.sliderTime.setValue(0)
-            
-        # 恢復視圖範圍
+
+        # 恢復視圖範圍 (不額外 refresh，update_time_display 的 finally 已處理)
         self.iface.mapCanvas().setExtent(current_extent)
-        self.iface.mapCanvas().refresh()
             
     # --- MODIFIED: This function now works with the filtered timeline ---
     def update_time_display(self, slider_index):
-        """
-        Handler for the slider's valueChanged signal.
-        This corrected logic guarantees the UI time label is always updated first.
-        """
-        print(f"update_time_display called: master index = {slider_index}")
+            """
+            [防閃爍終極版] 更新時間顯示與圖層數據
+            整合了：凍結畫布、智能資料合併、雙層符號系統
+            """
+            from qgis.PyQt.QtCore import Qt
+            from qgis.PyQt.QtGui import QColor
+            import os
 
-        # Pre-condition: Validate that the slider_index is within bounds
-        if not self.flow_layer or not self.master_timeline or not (0 <= slider_index < len(self.master_timeline)):
-            print("Error: Invalid index or empty master timeline")
-            return
+            # 1. 基本安全檢查
+            if not self.master_timeline or not (0 <= slider_index < len(self.master_timeline)):
+                return
 
-        # 1. Get current time from Master Timeline using the slider's index
-        current_datetime = self.master_timeline[slider_index]
+            # ==========================================
+            # [關鍵] 暫停畫布渲染 (凍結畫面，防止閃爍)
+            # ==========================================
+            self.iface.mapCanvas().setRenderFlag(False)
 
-        # 2. **UNCONDITIONAL UI UPDATE (THE FIX):**
-        # Immediately update the UI label's text. This operation is now decoupled
-        # from the data lookup and executes on every call to this function.
-        if hasattr(self.dlg, 'lblCurrentTime'):
-            formatted_time = current_datetime.strftime("%Y-%m-%d %H:%M:%S")
-            self.dlg.lblCurrentTime.setText(formatted_time)
+            try:
+                current_datetime = self.master_timeline[slider_index]
 
-        # --- 全新的、支援「持續顯示」的最終邏輯 ---
+                # 2. 更新 UI 時間標籤
+                if hasattr(self.dlg, 'lblCurrentTime'):
+                    formatted_time = current_datetime.strftime("%Y-%m-%d %H:%M:%S")
+                    self.dlg.lblCurrentTime.setText(formatted_time)
 
-        # 1. 準備一個字典，用來存放每個檔案在當前時間點應該顯示的資料來源
-        sources_to_display = {}
+                # ==========================================
+                # [S-104 動態水深] 隨時間滑桿更新水深圖層
+                # ==========================================
+                if (self.bathymetry_manager is not None
+                        and self.bathymetry_manager.s104_time_series
+                        and self.bathymetry_manager.s102_depth is not None):
+                    nearest = self.bathymetry_manager._find_nearest_s104_time(current_datetime)
+                    if nearest is not None and nearest != self.bathymetry_manager.s104_current_time:
+                        self.bathymetry_manager.calculate_dynamic_depth(target_time=current_datetime)
+                        self._update_bathymetry_raster_data()
 
-        # 2. 遍歷所有已載入的檔案，為每個檔案找到最適合顯示的資料時間點
-        start_dt = self.dlg.dtStartTime.dateTime().toPyDateTime()
-        end_dt = self.dlg.dtEndTime.dateTime().toPyDateTime()
-        
-        for filepath, reader in self.multi_reader.files.items():
-            filename = os.path.basename(filepath)
-            print(f"🔍 處理檔案: {filename}")
-            
-            # 找出該檔案在使用者設定範圍內的所有時間點
-            valid_timestamps_in_range = [
-                (idx, ts) for idx, ts in enumerate(reader.time_points) 
-                if start_dt <= ts <= end_dt
-            ]
+                # 如果沒有 S-111 flow_layer，只需要處理水深更新（已完成上方），直接返回
+                if not self.flow_layer:
+                    return
 
-            print(f"  📅 範圍內時間點: {len(valid_timestamps_in_range)} 個")
-            for idx, (file_idx, ts) in enumerate(valid_timestamps_in_range):
-                time_diff = abs((ts - current_datetime).total_seconds()) / 3600.0  # 轉換為小時
-                print(f"    時間點 {idx+1}: {ts.strftime('%H:%M')} (距離目標 {time_diff:.1f} 小時)")
-
-            if valid_timestamps_in_range:
-                # 檢查檔案是否已經播放完畢
-                file_last_timestamp = max(reader.time_points)
-                file_first_timestamp = min(reader.time_points)
+                # 3. [核心邏輯] 尋找要在這個時間點顯示的資料來源
+                #    (包含持續顯示邏輯：找最近的時間點)
+                sources_to_display = {}
+                start_dt = self.dlg.dtStartTime.dateTime().toPyDateTime()
+                end_dt = self.dlg.dtEndTime.dateTime().toPyDateTime()
                 
-                print(f"  📊 檔案時間範圍: {file_first_timestamp.strftime('%m-%d %H:%M')} ~ {file_last_timestamp.strftime('%m-%d %H:%M')}")
-                print(f"  🎯 當前動畫時間: {current_datetime.strftime('%m-%d %H:%M')}")
+                for filepath, reader in self.multi_reader.files.items():
+                    # 找出該檔案在使用者設定範圍內的所有時間點
+                    valid_timestamps_in_range = [
+                        (idx, ts) for idx, ts in enumerate(reader.time_points) 
+                        if start_dt <= ts <= end_dt
+                    ]
+
+                    if valid_timestamps_in_range:
+                        file_last_timestamp = max(reader.time_points)
+                        file_first_timestamp = min(reader.time_points)
+                        
+                        # 過濾：如果當前時間已經超過檔案最後時間，或還沒到開始時間，就不顯示
+                        if current_datetime > file_last_timestamp:
+                            continue 
+                        if current_datetime < file_first_timestamp:
+                            continue 
+                        
+                        # 策略：選擇距離當前動畫時間「最近」的資料點
+                        selected_index, selected_timestamp = min(
+                            valid_timestamps_in_range, 
+                            key=lambda item: abs((item[1] - current_datetime).total_seconds())
+                        )
+                        
+                        # 記錄下來
+                        if selected_timestamp not in sources_to_display:
+                            sources_to_display[selected_timestamp] = []
+
+                        source_tuple = (filepath, selected_index)
+                        if source_tuple not in sources_to_display[selected_timestamp]:
+                            sources_to_display[selected_timestamp].append(source_tuple)
+
+                # 4. 組合所有來源
+                sources = []
+                for timestamp, source_list in sorted(sources_to_display.items()):
+                    sources.extend(source_list)
+
+                # 5. [資料處理] 地理範圍級重疊解析 + 特徵生成
+                all_features = []
+                source_filenames = []
+                sources_snapshot = []
+
+                if sources:
+                    # [核心] 在生成特徵之前，先計算每個檔案的所有權遮罩
+                    # 重疊區域只保留 Issue Date 最新的檔案
+                    ownership_masks = self._compute_s111_ownership(sources)
+
+                    for filepath, index_in_file in sources:
+                        if filepath in self.multi_reader.files:
+                            reader = self.multi_reader.files[filepath]
+                            fname = os.path.basename(filepath)
+                            source_filenames.append(fname)
+
+                            # 取得此檔案的所有權遮罩 (None 表示無遮罩，全部可見)
+                            mask = ownership_masks.get(filepath, None)
+
+                            # 讀取特徵，跳過被遮罩的格點
+                            feats = self.get_features_for_source(
+                                reader, index_in_file, fname,
+                                ownership_mask=mask
+                            )
+                            all_features.extend(feats)
+                            sources_snapshot.append((reader, index_in_file, fname, mask))
+
+                # 6. 圖層名稱保持固定，避免動畫期間不斷改名導致圖層樹混亂
+                # (名稱在 setup_persistent_layer 中統一設定為 "S111 Global Flow Data")
+
+                # 7. 更新檔案列表高亮 (UI)
+                if hasattr(self.dlg, 'fileListWidget') and sources:
+                    active_filepaths = [src_path for src_path, _ in sources]
+                    for i in range(self.dlg.fileListWidget.count()):
+                        item = self.dlg.fileListWidget.item(i)
+                        if item:
+                            is_active = item.data(Qt.UserRole) in active_filepaths
+                            # 亮綠色表示正在播放，透明表示未播放
+                            item.setBackground(QColor(200, 255, 200) if is_active else QColor(255, 255, 255, 0))
+
+                # 8. [資料注入] 更新圖層數據
+                #    因為畫布凍結中，這裡做多少操作都不會閃爍
+                provider = self.flow_layer.dataProvider()
+                provider.truncate() # 清空舊資料
+                provider.addFeatures(all_features) # 寫入新資料
+                self.flow_layer.updateExtents()
+                self._flow_raw_cache = {'sources': sources_snapshot} if sources_snapshot else None
                 
-                # 如果當前動畫時間已經超過檔案的最後時間點，該檔案應該被清除
-                if current_datetime > file_last_timestamp:
-                    print(f"  ❌ 檔案已播放完畢，不顯示 (最後時間點: {file_last_timestamp.strftime('%m-%d %H:%M')})")
-                    continue  # 跳過這個檔案，不顯示其資料
+                # 9. [符號應用] 重新應用 S-111 雙層符號
+                #    這確保每次數據變動後，箭頭大小和顏色都是正確的
+                #self.apply_s111_standard_symbology(self.flow_layer)
                 
-                # 如果當前動畫時間還沒到檔案的開始時間，該檔案還不應該顯示
-                if current_datetime < file_first_timestamp:
-                    print(f"  ⏳ 檔案尚未開始播放 (開始時間點: {file_first_timestamp.strftime('%m-%d %H:%M')})")
-                    continue  # 跳過這個檔案
+                # 10. 品質檢查 (Quality Monitoring)
+                if hasattr(self, 'comparison_reader') and self.comparison_reader:
+                    self.perform_quality_check()
+
+                # 11. 四天驗證熱點隨時間滑桿同步更新
+                if self.uncertainty_readers and self.uncertainty_hotspot_layers:
+                    self._recalculate_uncertainty_hotspot(slider_index)
+
+            except Exception as e:
+                print(f"更新顯示時發生錯誤: {e}")
+                import traceback
+                traceback.print_exc()
+                self.log_error(f"更新顯示錯誤: {e}", show_dialog=False)
                 
-                # 檔案在有效播放期間內，選擇最合適的資料點
-                # 策略：選擇距離當前動畫時間最近的資料點（無論過去或未來）
-                selected_index, selected_timestamp = min(
-                    valid_timestamps_in_range, 
-                    key=lambda item: abs((item[1] - current_datetime).total_seconds())
-                )
-                
-                time_diff_hours = abs((selected_timestamp - current_datetime).total_seconds()) / 3600.0
-                print(f"  ✅ 選中時間點: {selected_timestamp.strftime('%m-%d %H:%M')} (距離 {time_diff_hours:.1f} 小時)")
-
-                # 把選定的資料來源記錄下來
-                if selected_timestamp not in sources_to_display:
-                    sources_to_display[selected_timestamp] = []
-
-                source_tuple = (filepath, selected_index)
-                if source_tuple not in sources_to_display[selected_timestamp]:
-                    sources_to_display[selected_timestamp].append(source_tuple)
-            else:
-                print(f"  ❌ 檔案在設定的UI時間範圍內沒有資料點")
-
-        # 3. 檢查我們是否找到了任何可以顯示的資料
-        if not sources_to_display:
-            # 如果在所有檔案中都找不到任何符合條件的資料，才清空畫面
-            self.flow_layer.dataProvider().truncate()
-            self.flow_layer.triggerRepaint()
-            self.iface.mapCanvas().refresh()
-            print(f"在 {current_datetime} 及其之前，找不到任何在使用者範圍內的有效資料。")
-            return # 結束函式
-
-        # 4. 組合所有需要顯示的資料來源
-        all_sources = []
-        for timestamp, source_list in sorted(sources_to_display.items()):
-            all_sources.extend(source_list)
-            print(f"✅ 準備顯示時間點 {timestamp} 的資料，來源: {[os.path.basename(s[0]) for s in source_list]}")
-
-        # 將 all_sources 賦值給 sources 變數，以便後續程式碼可以繼續使用
-        sources = all_sources
-
-        # --- 新邏輯結束 ---
-        
-        # 檢查是否有資料來源可供顯示
-        if not sources:
-            print(f"❌ 警告: 沒有找到任何可顯示的資料來源")
-            self.flow_layer.dataProvider().truncate()
-            self.flow_layer.triggerRepaint()
-            self.iface.mapCanvas().refresh()
-            return
-
-        # ==================== 使用新的持續顯示邏輯進行智能資料合併顯示 ====================
-        # 顯示所有檔案的資料，但使用空間去重邏輯避免重疊
-        print(f"使用持續顯示邏輯 (目標時間 {current_datetime.strftime('%H:%M:%S')}) 有 {len(sources)} 個來源，使用智能合併顯示")
-        
-        all_features = []
-        source_filenames = []
-        
-        # 收集所有來源的原始資料
-        all_raw_features = []
-        
-        for filepath, index_in_file in sources:
-            if filepath in self.multi_reader.files:
-                reader = self.multi_reader.files[filepath]
-                source_filename = os.path.basename(filepath)
-                source_filenames.append(source_filename)
-
-                print(f"📊 正在從 {source_filename} 讀取資料 (索引: {index_in_file})")
-                # 從每個來源獲取特徵
-                features_from_source = self.get_features_for_source(reader, index_in_file, source_filename)
-                print(f"  -> 獲得 {len(features_from_source)} 個特徵")
-                all_raw_features.extend(features_from_source)
-            else:
-                print(f"❌ 檔案路徑 {filepath} 不在讀取器中")
-        
-        # 應用空間去重邏輯
-        all_features = self._merge_overlapping_features(all_raw_features)
-        print(f"原始特徵數: {len(all_raw_features)}, 合併後特徵數: {len(all_features)}")
-        # ==================== 核心修改結束 ====================
-
-        # 4. Update other UI feedback (time label already updated above)
-
-        if self.flow_layer:
-            display_name = ", ".join(source_filenames)
-            new_layer_name = f"S111 Flow (Source: {display_name})"
-            self.flow_layer.setName(new_layer_name)
-
-        if hasattr(self.dlg, 'fileListWidget'):
-            active_filepaths = [src_filepath for src_filepath, idx in sources]
-            for i in range(self.dlg.fileListWidget.count()):
-                item = self.dlg.fileListWidget.item(i)
-                if item and item.data(Qt.UserRole) in active_filepaths:
-                    item.setBackground(QColor(200, 255, 200)) # Highlight
-                elif item:
-                    item.setBackground(QColor(255, 255, 255, 0)) # No highlight
-
-        # 6. Update layer data in one go
-        provider = self.flow_layer.dataProvider()
-        provider.truncate() # Clear first
-        provider.addFeatures(all_features) # Add all features
-        self.flow_layer.updateExtents()
-        self.flow_layer.triggerRepaint()
-        self.iface.mapCanvas().refresh()
-        print(f"Layer updated with {len(all_features)} features from {len(sources)} source(s).")
+            finally:
+                # ==========================================
+                # [關鍵] 解凍畫布，一次性刷新
+                # ==========================================
+                # 無論上面成功還是失敗，最後一定要把畫筆還給 QGIS
+                self.iface.mapCanvas().setRenderFlag(True)
+                if self.flow_layer:
+                    self.flow_layer.triggerRepaint()  # S-111 重繪
+                self.iface.mapCanvas().refresh()
 
     def _merge_overlapping_features(self, all_raw_features):
         """
@@ -2226,84 +4472,173 @@ class S111Viewer:
     
     def _select_best_representative_feature(self, overlapping_features):
         """
-        從重疊特徵中選擇最佳代表特徵
-        
-        選擇策略：
-        1. 優先選擇速度最大的特徵（通常更重要）
-        2. 如果速度相近，優先選擇來自最新檔案的特徵
-        3. 在屬性中記錄合併資訊
-        
-        Args:
-            overlapping_features (list): 重疊位置的特徵列表
-            
-        Returns:
-            QgsFeature: 選定的代表特徵
+        從重疊特徵中選擇最佳代表特徵 (備用方案，主要邏輯已移至 _compute_s111_ownership)
         """
         if len(overlapping_features) == 1:
             return overlapping_features[0]
-        
-        # 按速度降序排序，選擇最大速度的特徵
+
+        # 簡單選擇速度最大的
         def get_speed(feature):
             try:
-                return float(feature.attribute('speed') or 0)
+                return float(feature.attribute('Speed') or feature.attribute('speed') or 0)
             except (ValueError, TypeError):
                 return 0
-        
-        # 排序：速度優先，然後按來源檔案名稱
-        sorted_features = sorted(overlapping_features, 
-                               key=lambda f: (-get_speed(f), f.attribute('source') or ''))
-        
-        best_feature = sorted_features[0]
-        
-        # 在屬性中添加合併資訊
-        source_list = []
-        speed_list = []
-        for feat in overlapping_features:
-            source = feat.attribute('source') or 'Unknown'
-            speed = get_speed(feat)
-            source_list.append(source)
-            speed_list.append(f"{speed:.2f}")
-        
-        # 更新最佳特徵的屬性以顯示合併資訊
-        best_feature.setAttribute('merged_sources', '; '.join(set(source_list)))
-        best_feature.setAttribute('all_speeds', ', '.join(speed_list))
-        best_feature.setAttribute('merged_count', len(overlapping_features))
-        
-        return best_feature
 
-    def get_features_for_source(self, reader, index_in_file, source_filename):
+        return max(overlapping_features, key=get_speed)
+
+    def _compute_s111_ownership(self, sources):
+        """
+        [地理範圍級重疊解析] 在生成特徵之前，根據各 S-111 檔案的經緯度範圍
+        和 Issue Date 計算每個檔案的「所有權遮罩」。
+
+        原理：
+        1. 解析每個檔案的 geotransform + grid shape → 經緯度 bounding box
+        2. 偵測哪些檔案在空間上重疊
+        3. 重疊區域中，較舊 Issue Date 的檔案被遮罩 (False)，較新的保留 (True)
+        4. 回傳每個檔案的 boolean mask，後續 get_features_for_source() 據此跳過被遮罩的格點
+
+        Args:
+            sources: list of (filepath, index_in_file) tuples
+
+        Returns:
+            dict: {filepath: np.ndarray(bool)} 每個檔案的所有權遮罩
+        """
+        import datetime as _dt
+        import os
+
+        source_info = []
+        for filepath, index_in_file in sources:
+            reader = self.multi_reader.files.get(filepath)
+            if not reader or index_in_file >= len(reader.surfaces):
+                continue
+
+            gt = reader.geotransform
+            if not gt:
+                continue
+
+            # 取得 grid shape
+            surface_data = reader.surfaces[index_in_file]
+            try:
+                if isinstance(surface_data, (list, tuple)) and len(surface_data) >= 2:
+                    spd = surface_data[0]
+                elif isinstance(surface_data, (list, tuple)) and len(surface_data) == 1:
+                    spd = surface_data[0]
+                else:
+                    spd = surface_data
+
+                if not hasattr(spd, 'shape'):
+                    continue
+
+                if len(spd.shape) == 3:
+                    shape = (spd.shape[0], spd.shape[1]) if spd.shape[2] <= 2 else (spd.shape[1], spd.shape[2])
+                elif len(spd.shape) == 2:
+                    shape = spd.shape
+                else:
+                    continue  # 1D (Type 3) 不適用 grid mask
+            except Exception:
+                continue
+
+            height, width = shape
+            if height <= 0 or width <= 0:
+                continue
+
+            # 計算 bounding box (WGS84)
+            west = gt[0]
+            east = gt[0] + width * gt[1]
+            north = gt[3]
+            south = gt[3] + height * gt[5]  # gt[5] 為負值
+
+            issue_date = reader.issue_date or _dt.datetime(2000, 1, 1)
+
+            source_info.append({
+                'filepath': filepath,
+                'index': index_in_file,
+                'gt': gt,
+                'shape': (height, width),
+                'bbox': (west, east, south, north),
+                'issue_date': issue_date,
+            })
+
+        # 初始化所有遮罩為 True (全部可見)
+        masks = {}
+        for info in source_info:
+            masks[info['filepath']] = np.ones(info['shape'], dtype=bool)
+
+        # 兩兩比較，偵測重疊，較舊檔案的重疊區被遮罩
+        for i in range(len(source_info)):
+            for j in range(i + 1, len(source_info)):
+                info_a = source_info[i]
+                info_b = source_info[j]
+
+                # 如果 Issue Date 相同，不遮罩 (兩者都保留)
+                if info_a['issue_date'] == info_b['issue_date']:
+                    continue
+
+                # 計算重疊區域
+                a_west, a_east, a_south, a_north = info_a['bbox']
+                b_west, b_east, b_south, b_north = info_b['bbox']
+
+                overlap_west = max(a_west, b_west)
+                overlap_east = min(a_east, b_east)
+                overlap_south = max(a_south, b_south)
+                overlap_north = min(a_north, b_north)
+
+                if overlap_west >= overlap_east or overlap_south >= overlap_north:
+                    continue  # 無重疊
+
+                # 決定新舊
+                if info_a['issue_date'] >= info_b['issue_date']:
+                    newer, older = info_a, info_b
+                else:
+                    newer, older = info_b, info_a
+
+                # 在較舊檔案的 grid 中，將重疊區域標記為 False
+                o_gt = older['gt']
+                o_h, o_w = older['shape']
+
+                # 將重疊 bbox 轉換為舊檔案的 grid index
+                # X: (lon - west) / xres
+                x_start = max(0, int((overlap_west - o_gt[0]) / o_gt[1]))
+                x_end = min(o_w, int(np.ceil((overlap_east - o_gt[0]) / o_gt[1])))
+                # Y: gt[5] 為負值，north → 較小 index, south → 較大 index
+                y_start = max(0, int((overlap_north - o_gt[3]) / o_gt[5]))
+                y_end = min(o_h, int(np.ceil((overlap_south - o_gt[3]) / o_gt[5])))
+
+                if x_start < x_end and y_start < y_end:
+                    masks[older['filepath']][y_start:y_end, x_start:x_end] = False
+                    print(f"[S-111 Overlap] 較舊檔案 {os.path.basename(older['filepath'])} "
+                          f"(Issue: {older['issue_date']}) 重疊區域被遮罩: "
+                          f"lon [{overlap_west:.4f}~{overlap_east:.4f}], "
+                          f"lat [{overlap_south:.4f}~{overlap_north:.4f}], "
+                          f"grid[{y_start}:{y_end}, {x_start}:{x_end}] → "
+                          f"被較新檔案 {os.path.basename(newer['filepath'])} "
+                          f"(Issue: {newer['issue_date']}) 覆蓋")
+
+        return masks
+
+    def get_features_for_source(self, reader, index_in_file, source_filename, ownership_mask=None):
         """
         從指定的讀取器和檔案內索引提取特徵數據
-        
+        [效能優化版] 加入 Viewport Clipping (視窗裁切) + 所有權遮罩機制
+
         Args:
-            reader (S111Reader): 數據讀取器
-            index_in_file (int): 該讀取器中的時間索引
-            source_filename (str): 數據來源檔案名稱，用於屬性記錄
-            
-        Returns:
-            list: QgsFeature 對象列表
+            reader: S111Reader 實例
+            index_in_file: 時間點索引
+            source_filename: 來源檔名
+            ownership_mask: np.ndarray(bool) 或 None，False 的格點會被跳過
+                            (由 _compute_s111_ownership 計算，重疊區域較舊檔案被遮罩)
         """
         features = []
         
         # 驗證輸入參數
         if not reader or index_in_file >= len(reader.surfaces):
-            print(f"錯誤: 無效的讀取器或索引 {index_in_file} 超出範圍 (最大: {len(reader.surfaces)-1 if reader else 'N/A'})")
+            print(f"錯誤: 無效的讀取器或索引 {index_in_file} 超出範圍")
             return features
             
         # 獲取指定時間點的數據
         surface_data = reader.surfaces[index_in_file]
         
-        # 添加調試資訊來檢查數據結構
-        print(f"surface_data 類型: {type(surface_data)}")
-        print(f"surface_data 內容: {surface_data}")
-        if hasattr(surface_data, 'shape'):
-            print(f"surface_data 形狀: {surface_data.shape}")
-        if isinstance(surface_data, (list, tuple)):
-            print(f"surface_data 長度: {len(surface_data)}")
-            for i, item in enumerate(surface_data):
-                print(f"  項目 {i}: {type(item)}, 形狀: {getattr(item, 'shape', 'N/A')}")
-        
-        # 根據數據結構嘗試解包
+        # --- 數據解包 ---
         speed = None
         direction = None
         
@@ -2311,429 +4646,3585 @@ class S111Viewer:
             if isinstance(surface_data, (list, tuple)):
                 if len(surface_data) >= 2:
                     speed, direction = surface_data[0], surface_data[1]
-                    print("成功從 tuple/list 解包 speed 和 direction")
                 elif len(surface_data) == 1:
-                    print("警告: surface_data 只有一個元素，可能是組合數據")
-                    # 檢查是否是包含兩個通道的數據
                     single_data = surface_data[0]
                     if hasattr(single_data, 'shape') and len(single_data.shape) >= 3:
-                        print(f"嘗試從 3D 陣列解包，形狀: {single_data.shape}")
-                        if single_data.shape[-1] == 2 or single_data.shape[0] == 2:
-                            if single_data.shape[0] == 2:
-                                speed = single_data[0]
-                                direction = single_data[1]
-                            elif single_data.shape[-1] == 2:
-                                speed = single_data[..., 0]
-                                direction = single_data[..., 1]
-                            print("成功從 3D 陣列解包")
+                        if single_data.shape[-1] == 2:
+                            speed = single_data[..., 0]
+                            direction = single_data[..., 1]
+                        elif single_data.shape[0] == 2:
+                            speed = single_data[0]
+                            direction = single_data[1]
                         else:
-                            print("警告: 3D 陣列不包含 2 個通道，使用同一數據作為 speed 和 direction")
                             speed = single_data
                             direction = single_data
                     else:
-                        print("使用單一數據作為 speed 和 direction")
                         speed = single_data
                         direction = single_data
-                else:
-                    print("錯誤: surface_data 為空")
-                    return features
             elif hasattr(surface_data, 'shape'):
-                # 直接的 numpy 陣列
                 if len(surface_data.shape) >= 3:
-                    print(f"嘗試從直接 3D 陣列解包，形狀: {surface_data.shape}")
                     if surface_data.shape[-1] == 2:
                         speed = surface_data[..., 0]
                         direction = surface_data[..., 1]
-                        print("成功從直接 3D 陣列解包 (最後維度)")
                     elif surface_data.shape[0] == 2:
                         speed = surface_data[0]
                         direction = surface_data[1]
-                        print("成功從直接 3D 陣列解包 (第一維度)")
-                    else:
-                        print("警告: 3D 陣列不包含 2 個通道，使用同一數據")
-                        speed = surface_data
-                        direction = surface_data
                 else:
-                    print("使用直接 2D 陣列作為 speed 和 direction")
                     speed = surface_data
                     direction = surface_data
-            else:
-                print(f"錯誤: 無法識別的 surface_data 結構")
+                    
+            if speed is None or direction is None:
                 return features
+
+            # 確保維度正確 (移除多餘維度)
+            if len(speed.shape) == 3: speed = speed[:, :, 0] if speed.shape[2] == 1 else speed[0, :, :]
+            if len(direction.shape) == 3: direction = direction[:, :, 0] if direction.shape[2] == 1 else direction[0, :, :]
                 
         except Exception as e:
-            print(f"解包 surface_data 時出錯: {e}")
-            print(f"surface_data 詳細信息: {surface_data}")
-            import traceback
-            print(traceback.format_exc())
+            print(f"解包錯誤: {e}")
             return features
-            
-        # 檢查解包結果
-        if speed is None or direction is None:
-            print("錯誤: 無法獲取 speed 或 direction 數據")
-            return features
-            
-        print(f"解包成功 - Speed 形狀: {getattr(speed, 'shape', 'N/A')}, Direction 形狀: {getattr(direction, 'shape', 'N/A')}")
-            
+
         geotransform = reader.geotransform
-        
-        # 設置備用地理參考信息
         if not geotransform:
-            geotransform = [118.0, 0.01, 0, 22.0, 0, -0.01]  # 備用值
+            geotransform = [118.0, 0.01, 0, 22.0, 0, -0.01]
+
+        # --- [S-111 H-5 嚴格算法實作] ---
         
-        # 根據數據格式處理不同類型的數據
-        if reader.data_format == 2:
-            # Type 2: 規則網格資料處理
-            print(f"處理 Type 2 (規則網格) 資料，數據形狀: {speed.shape}")
-            height, width = speed.shape
-            step = 1  # 可以根據需要調整採樣間隔以提高性能
+        # 1. 找出區域內的最大流速 (S_max)
+        try:
+            max_idx = np.nanargmax(speed)
+            max_y, max_x = np.unravel_index(max_idx, speed.shape)
+            max_speed_val = float(speed[max_y, max_x])
+        except:
+            max_y, max_x = 0, 0
+            max_speed_val = 5.0 # Fallback default
             
-            for y in range(0, height, step):
-                for x in range(0, width, step):
+        # 2. 計算抽稀步長 n (Step)
+        step = self._calculate_strict_n(max_speed_val, geotransform)
+        
+        # 獲取當前地圖視窗範圍 (Viewport Extent)
+        canvas_extent = self.iface.mapCanvas().extent()
+        # 稍微擴大一點範圍，避免邊緣的箭頭突然消失
+        buffer = abs(geotransform[1]) * step * 2
+        view_xmin = canvas_extent.xMinimum() - buffer
+        view_xmax = canvas_extent.xMaximum() + buffer
+        view_ymin = canvas_extent.yMinimum() - buffer
+        view_ymax = canvas_extent.yMaximum() + buffer
+
+        # 3. 遍歷網格 (Type 2) - [效能優化重點]
+        if reader.data_format == 2:
+            height, width = speed.shape
+            
+            # S-111 錨點 (Anchor Point) 計算
+            global_start_y = max_y % step
+            global_start_x = max_x % step
+            
+            # --- Viewport Clipping 核心邏輯 ---
+            # 將地圖座標轉換為 Array Index
+            gt = geotransform
+            # gt[0]=TopLeftX, gt[1]=PixelWidth, gt[3]=TopLeftY, gt[5]=PixelHeight(負值)
+            
+            # 計算 X 軸索引範圍 (Lon)
+            idx_x_min = int((view_xmin - gt[0]) / gt[1])
+            idx_x_max = int((view_xmax - gt[0]) / gt[1]) + 1
+            
+            # 計算 Y 軸索引範圍 (Lat)
+            # 注意: gt[5] 是負的，所以 y_max (北) 對應較小的 index
+            idx_y_min = int((view_ymax - gt[3]) / gt[5])
+            idx_y_max = int((view_ymin - gt[3]) / gt[5]) + 1
+            
+            # 限制索引在 Array 範圍內 (Clamp)
+            idx_x_min = max(0, min(idx_x_min, width))
+            idx_x_max = max(0, min(idx_x_max, width))
+            idx_y_min = max(0, min(idx_y_min, height))
+            idx_y_max = max(0, min(idx_y_max, height))
+            
+            # 重新校正迴圈起始點，確保網格對齊 (Grid Alignment)
+            # 公式: new_start = current_min + (anchor - current_min) % step
+            real_start_y = idx_y_min + (global_start_y - idx_y_min) % step
+            real_start_x = idx_x_min + (global_start_x - idx_x_min) % step
+            
+            # 只迴圈「看得到」的範圍，而不是整個 height * width
+            drawn_points = set()  # 記錄已繪製的點，避免重複
+
+            for y in range(real_start_y, idx_y_max, step):
+                for x in range(real_start_x, idx_x_max, step):
                     try:
+                        # [所有權遮罩] 跳過被較新檔案覆蓋的格點
+                        if ownership_mask is not None and not ownership_mask[y, x]:
+                            continue
+
                         s = float(speed[y, x])
                         d = float(direction[y, x])
-                        
-                        # 檢查是否為有效數據
-                        if np.isnan(s) or np.isnan(d):
+
+                        # 檢查有效性
+                        if np.isnan(s) or np.isnan(d) or s <= 0.0:
                             continue
-                            
-                        # 使用 geotransform 計算地理座標
+
+                        # 計算座標
                         lon = geotransform[0] + x * geotransform[1]
                         lat = geotransform[3] + y * geotransform[5]
-                        
-                        # 創建特徵
+
                         feature = QgsFeature(self.flow_layer.fields())
                         feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
-                        
-                        # 設置屬性: [Longitude, Latitude, Speed, Direction, Source, merged_sources, all_speeds, merged_count]
                         feature.setAttributes([lon, lat, s, d, source_filename, None, None, 1])
                         features.append(feature)
-                        
-                    except Exception as e:
-                        print(f"處理 Type 2 數據點 ({x}, {y}) 時出錯: {e}")
+                        drawn_points.add((y, x))
+
+                    except Exception:
                         continue
+
+            # ==========================================
+            # S-111 Safety Override Rule (強制繪製最大流速點)
+            # ==========================================
+            # 即使最大流速點不符合抽稀間隔，也必須繪製以避免隱藏危險海況
+            # 但仍須尊重所有權遮罩 (被較新檔案覆蓋的區域不強制繪製)
+            if (max_y, max_x) not in drawn_points:
+                mask_ok = (ownership_mask is None or ownership_mask[max_y, max_x])
+                if mask_ok and idx_y_min <= max_y < idx_y_max and idx_x_min <= max_x < idx_x_max:
+                    try:
+                        s = float(speed[max_y, max_x])
+                        d = float(direction[max_y, max_x])
+
+                        if not (np.isnan(s) or np.isnan(d) or s <= 0.0):
+                            lon = geotransform[0] + max_x * geotransform[1]
+                            lat = geotransform[3] + max_y * geotransform[5]
+
+                            feature = QgsFeature(self.flow_layer.fields())
+                            feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
+                            feature.setAttributes([lon, lat, s, d, source_filename, None, None, 1])
+                            features.append(feature)
+                            print(f"[Safety Override] 強制繪製最大流速點 ({max_y}, {max_x}): {s:.2f} m/s")
+                    except Exception as e:
+                        print(f"[Safety Override] 繪製最大流速點失敗: {e}")
+                        
         else:
-            # Type 3 或其他: 點集合資料處理
-            print(f"處理 Type 3 (點集合) 或其他格式資料，數據形狀: {speed.shape}")
-            
-            # 檢查是否為一維點集合數據
-            if len(speed.shape) == 1:
-                # Type 3 點集合：嘗試從 reader 中獲取地理座標
-                coordinates = self._get_positioning_data(reader)
-                
-                if coordinates is not None and len(coordinates) == len(speed):
-                    print(f"找到地理座標數據，處理 {len(speed)} 個點")
-                    for i in range(len(speed)):
-                        try:
-                            s = float(speed[i])
-                            d = float(direction[i])
-                            lon = float(coordinates[i][0])  # longitude
-                            lat = float(coordinates[i][1])  # latitude
-                            
-                            # 檢查是否為有效數據（跳過 -1 值）
-                            if s <= 0 or np.isnan(s) or np.isnan(d) or np.isnan(lon) or np.isnan(lat):
-                                continue
-                            
-                            # 創建特徵
+            # Type 3 (點集合) - 簡單優化
+            total_points = len(speed)
+            coordinates = self._get_positioning_data(reader)
+            drawn_points = set()  # 記錄已繪製的點
+
+            # 找出 Type 3 的最大流速點索引
+            try:
+                max_idx_1d = np.nanargmax(speed)
+            except:
+                max_idx_1d = 0
+
+            for i in range(0, total_points, step):
+                try:
+                    s = float(speed[i])
+                    d = float(direction[i])
+
+                    if s <= 0 or np.isnan(s) or np.isnan(d): continue
+
+                    if coordinates is not None:
+                        lon, lat = float(coordinates[i][0]), float(coordinates[i][1])
+                    else:
+                        lon = geotransform[0] + i * geotransform[1]
+                        lat = geotransform[3]
+
+                    # Type 3 簡單過濾：檢查點是否在視窗內
+                    if not (view_xmin <= lon <= view_xmax and view_ymin <= lat <= view_ymax):
+                        continue
+
+                    feature = QgsFeature(self.flow_layer.fields())
+                    feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
+                    feature.setAttributes([lon, lat, s, d, source_filename, None, None, 1])
+                    features.append(feature)
+                    drawn_points.add(i)
+                except:
+                    continue
+
+            # ==========================================
+            # S-111 Safety Override Rule (強制繪製最大流速點)
+            # ==========================================
+            if max_idx_1d not in drawn_points:
+                try:
+                    s = float(speed[max_idx_1d])
+                    d = float(direction[max_idx_1d])
+
+                    if not (s <= 0 or np.isnan(s) or np.isnan(d)):
+                        if coordinates is not None:
+                            lon, lat = float(coordinates[max_idx_1d][0]), float(coordinates[max_idx_1d][1])
+                        else:
+                            lon = geotransform[0] + max_idx_1d * geotransform[1]
+                            lat = geotransform[3]
+
+                        # 檢查是否在視窗內
+                        if view_xmin <= lon <= view_xmax and view_ymin <= lat <= view_ymax:
                             feature = QgsFeature(self.flow_layer.fields())
                             feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
-                            
-                            # 設置屬性: [Longitude, Latitude, Speed, Direction, Source, merged_sources, all_speeds, merged_count]
                             feature.setAttributes([lon, lat, s, d, source_filename, None, None, 1])
                             features.append(feature)
-                            
-                        except Exception as e:
-                            print(f"處理 Type 3 數據點 {i} 時出錯: {e}")
-                            continue
-                else:
-                    print("警告: 無法找到地理座標數據或座標數量與數據點不匹配，使用 geotransform")
-                    # 回退到使用 geotransform 的方法（將一維數據視為一行）
-                    for i in range(len(speed)):
-                        try:
-                            s = float(speed[i])
-                            d = float(direction[i])
-                            
-                            # 檢查是否為有效數據
-                            if s <= 0 or np.isnan(s) or np.isnan(d):
-                                continue
-                                
-                            # 計算地理座標（將一維索引轉換為 x, y）
-                            lon = geotransform[0] + i * geotransform[1]
-                            lat = geotransform[3]  # 假設所有點在同一緯度
-                            
-                            # 創建特徵
-                            feature = QgsFeature(self.flow_layer.fields())
-                            feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
-                            
-                            # 設置屬性: [Longitude, Latitude, Speed, Direction, Source, merged_sources, all_speeds, merged_count]
-                            feature.setAttributes([lon, lat, s, d, source_filename, None, None, 1])
-                            features.append(feature)
-                            
-                        except Exception as e:
-                            print(f"處理 Type 3 數據點 {i} 時出錯: {e}")
-                            continue
-            else:
-                # 二維網格資料處理 (原有邏輯)
-                height, width = speed.shape
-                step = 1  # 可以根據需要調整採樣間隔以提高性能
-                
-                for y in range(0, height, step):
-                    for x in range(0, width, step):
-                        try:
-                            s = float(speed[y, x])
-                            d = float(direction[y, x])
-                            
-                            # 檢查是否為有效數據
-                            if np.isnan(s) or np.isnan(d):
-                                continue
-                                
-                            # 計算地理座標
-                            lon = geotransform[0] + x * geotransform[1]
-                            lat = geotransform[3] + y * geotransform[5]
-                            
-                            # 創建特徵
-                            feature = QgsFeature(self.flow_layer.fields())
-                            feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
-                            
-                            # 設置屬性: [Longitude, Latitude, Speed, Direction, Source, merged_sources, all_speeds, merged_count]
-                            feature.setAttributes([lon, lat, s, d, source_filename, None, None, 1])
-                            features.append(feature)
-                            
-                        except Exception as e:
-                            print(f"處理數據點 ({x}, {y}) 時出錯: {e}")
-                            continue
-                    
-        print(f"從來源 '{source_filename}' 的索引 {index_in_file} 提取了 {len(features)} 個特徵")
+                            print(f"[Safety Override Type 3] 強制繪製最大流速點 (index={max_idx_1d}): {s:.2f} m/s")
+                except Exception as e:
+                    print(f"[Safety Override Type 3] 繪製最大流速點失敗: {e}")
+
         return features
-        
+
+    def _calculate_strict_n(self, max_speed_val, geotransform):
+        """
+        [S-111 核心算法] 計算抽稀步長 n
+        依據 IHO S-111 Edition 2.0.0, Section 9.3 箭頭尺寸縮放規範設計
+        """
+        try:
+            # 1. 計算 H_max (最大箭頭長度)
+            # S-111 規範: 將流速限制在 2-13 節範圍內
+            S_clamped = max(2.0, min(13.0, max_speed_val))
+            H_max = 10.0 * (S_clamped / 5.0)
+
+            # 2. 計算 D (網格對角線在螢幕上的長度, mm)
+            scale = self.iface.mapCanvas().scale()
+            res_x_deg = abs(geotransform[1])
+            res_y_deg = abs(geotransform[5])
+            mean_lat = (geotransform[3] + (geotransform[3] + res_y_deg * -10)) / 2
+            meters_per_deg_lat = 111319.0
+            meters_per_deg_lon = 111319.0 * math.cos(math.radians(mean_lat))
+            width_m = res_x_deg * meters_per_deg_lon
+            height_m = res_y_deg * meters_per_deg_lat
+            diag_m = math.sqrt(width_m**2 + height_m**2)
+
+            # D_mm = (Real_Meters * 1000) / Scale
+            D_mm = (diag_m * 1000.0) / scale
+
+            # 3. 稀疏步長公式: n = 1 + int(H_max / (0.5 * D))
+            if D_mm > 0:
+                n = 1 + int(H_max / (0.5 * D_mm))
+            else:
+                n = 1
+
+            n = max(1, n)
+
+            # 調試輸出
+            print(f"[S-111 Thinning Algorithm]")
+            print(f"  Max Speed: {max_speed_val:.2f} m/s → Clamped: {S_clamped:.2f}")
+            print(f"  H_max (最大箭頭長度): {H_max:.2f} mm")
+            print(f"  D (網格對角線): {D_mm:.4f} mm")
+            print(f"  Scale: 1:{scale:.0f}")
+            print(f"  計算結果: n = {n} (每 {n} 個點繪製一支箭頭)")
+
+            return n
+
+        except Exception as e:
+            print(f"計算抽稀步長 n 失敗: {e}, 使用預設值 5")
+            return 5
+
     def _get_positioning_data(self, reader):
-        """
-        獲取地理座標數據 (從 reader 中已預先載入的座標)
-        
-        Args:
-            reader (S111Reader): 數據讀取器
-            
-        Returns:
-            numpy.ndarray: 座標陣列 [[lon1, lat1], [lon2, lat2], ...] 或 None
-        """
+        """獲取地理座標數據"""
         return reader.positioning_coordinates
+
     def update_layer_data_with_reader(self, reader, time_index, source_filename=""):
-        """
-        使用指定的讀取器和時間索引更新圖層數據
-        
-        Args:
-            reader (S111Reader): 指定的數據讀取器
-            time_index (int): 該讀取器中的時間索引
-            source_filename (str): 數據來源檔案名稱，用於屬性記錄
-        """
+        """使用指定的讀取器和時間索引更新圖層數據"""
         if not self.flow_layer or not reader:
             return
             
-        # 使用新的 get_features_for_source 方法來提取特徵
         features = self.get_features_for_source(reader, time_index, source_filename)
         
-        # 清除舊特徵並添加新特徵
-        print(f"正在更新圖層，添加 {len(features)} 個特徵...")
         provider = self.flow_layer.dataProvider()
-        provider.truncate()  # 清除所有現有特徵
+        provider.truncate()
         provider.addFeatures(features)
         self.flow_layer.updateExtents()
         self.flow_layer.triggerRepaint()
 
-        print(f"圖層更新完成")
-
     def update_layer_data(self, time_index):
-        """
-        舊版方法：使用當前讀取器更新圖層數據（為了向後兼容）
-        """
+        """舊版方法相容"""
         current_reader = self.multi_reader.get_current_reader()
         if current_reader:
-            # 為向後兼容，使用當前檔案名作為來源
             source_filename = ""
             if self.multi_reader.current_file:
                 source_filename = os.path.basename(self.multi_reader.current_file)
             self.update_layer_data_with_reader(current_reader, time_index, source_filename)
 
-
     def update_arrow_size(self, size):
-        """更新箭頭大小（在S-111標準模式下此功能被標準化）"""
-        print(f"update_arrow_size 被調用: 大小 = {size}")
-        print("注意: 在S-111標準模式下，箭頭大小由速度值自動計算")
-        
-        # 檢查固定圖層是否存在
-        if not self.flow_layer:
-            print("錯誤: 固定圖層不存在，無法更新箭頭大小")
+        """更新箭頭大小 (S-111 模式下僅觸發重繪)"""
+        if not self.flow_layer or not self.flow_layer.isValid():
             return
-            
-        # 檢查圖層是否有效
-        if not self.flow_layer.isValid():
-            print("錯誤: 固定圖層無效，無法更新箭頭大小")
-            return
-            
-        try:
-            # 在S-111標準模式下，大小由速度自動決定，但可以作為縮放係數
-            # 重新應用符號系統到固定圖層
-            print("開始重新應用符號系統...")
-            self.apply_s111_standard_symbology(self.flow_layer)
-            
-            # 確保圖層可見
-            self.flow_layer.setOpacity(1.0)
-            
-            # 強制刷新圖層
-            self.flow_layer.triggerRepaint()
-            self.flow_layer.updateExtents()
-            
-            # 刷新地圖畫布
-            self.iface.mapCanvas().refresh()
-            
-            # 檢查圖層是否有特徵
-            feature_count = self.flow_layer.featureCount()
-            print(f"圖層特徵數量: {feature_count}")
-            
-            # 檢查渲染器是否正確設置
-            renderer = self.flow_layer.renderer()
-            if renderer:
-                print(f"渲染器類型: {type(renderer).__name__}")
-            else:
-                print("警告: 圖層沒有渲染器")
-                
-            print("已重新應用符號系統到固定圖層")
-            
-        except Exception as e:
-            print(f"更新箭頭大小時出錯: {e}")
-            print(traceback.format_exc())
-            
-            # 嘗試恢復圖層顯示
-            try:
-                # 重新載入當前時間點的數據
-                if hasattr(self.dlg, 'sliderTime'):
-                    current_time = self.dlg.sliderTime.value()
-                    print(f"嘗試重新載入時間索引 {current_time} 的數據")
-                    self.update_layer_data(current_time)
-            except Exception as recovery_error:
-                print(f"恢復圖層顯示時出錯: {recovery_error}")
+        self.apply_s111_standard_symbology(self.flow_layer)
+        self.flow_layer.triggerRepaint()
+        self.iface.mapCanvas().refresh()
 
     def refresh_layer_display(self):
-        """刷新圖層顯示，用於解決箭頭消失的問題"""
-        print("刷新圖層顯示...")
-        
-        if not self.flow_layer:
-            print("錯誤: 固定圖層不存在")
+        """刷新圖層顯示"""
+        if not self.flow_layer: return
+        if hasattr(self.dlg, 'sliderTime'):
+            self.update_time_display(self.dlg.sliderTime.value())
+            self.apply_s111_standard_symbology(self.flow_layer)
+            self.flow_layer.triggerRepaint()
+            self.iface.mapCanvas().refresh()
+
+    def _on_scale_changed(self, scale):
+        """暫時停用縮放同步重繪，避免 hotspot/箭頭顯示隨視窗縮放改變。"""
+        return
+
+    def _redraw_all_on_scale(self):
+        """暫時停用縮放同步重繪。"""
+        return
+
+    def _redraw_flow_from_cache(self):
+        """用 flow raw cache 重新執行 get_features_for_source。"""
+        if not self.flow_layer or not self.flow_layer.isValid() or not self._flow_raw_cache:
             return
-            
-        try:
-            # 重新載入當前篩選後時間點的數據
-            if hasattr(self.dlg, 'sliderTime'):
-                current_slider_index = self.dlg.sliderTime.value()
-                print(f"刷新顯示，當前篩選後索引: {current_slider_index}")
-                # 直接調用 update_time_display，它會處理所有事情
-                self.update_time_display(current_slider_index)
-                
-                # 重新應用符號系統
-                print("重新應用符號系統...")
-                self.apply_s111_standard_symbology(self.flow_layer)
-                
-                # 確保圖層可見
-                self.flow_layer.setOpacity(1.0)
-                
-                # 強制刷新
-                self.flow_layer.triggerRepaint()
-                self.flow_layer.updateExtents()
-                self.iface.mapCanvas().refresh()
-                
-                print("圖層顯示已刷新")
-                
-        except Exception as e:
-            print(f"刷新圖層顯示時出錯: {e}")
-            print(traceback.format_exc())
+
+        sources = self._flow_raw_cache.get('sources', [])
+        features = []
+        for reader, index_in_file, source_filename, ownership_mask in sources:
+            features.extend(
+                self.get_features_for_source(
+                    reader, index_in_file, source_filename,
+                    ownership_mask=ownership_mask
+                )
+            )
+
+        provider = self.flow_layer.dataProvider()
+        provider.truncate()
+        if features:
+            provider.addFeatures(features)
+        self.flow_layer.updateExtents()
+        self.flow_layer.triggerRepaint()
+
+    def _redraw_hotspot_from_cache(self, offset, cache):
+        """用未抽樣的 hotspot cache 在新比例尺下重繪熱點圖層。"""
+        if not cache:
+            return
+
+        self._update_uncertainty_hotspot_layer(
+            offset,
+            cache.get('y_indices_full', np.array([], dtype=int)),
+            cache.get('x_indices_full', np.array([], dtype=int)),
+            cache.get('error_values_full', np.array([], dtype=float)),
+            cache.get('geotransform'),
+            cache.get('directions_full'),
+            cache.get('speed_values_full'),
+            cache.get('severity_values_full'),
+        )
+
+    def _redraw_comparison_from_cache(self):
+        """用未抽樣的 comparison cache 在新比例尺下重繪差異圖層。"""
+        cache = self._comparison_raw_cache
+        if not cache:
+            return
+
+        self.update_difference_layer(
+            cache.get('y_indices_full', np.array([], dtype=int)),
+            cache.get('x_indices_full', np.array([], dtype=int)),
+            cache.get('diff_values_full', np.array([], dtype=float)),
+            cache.get('geotransform'),
+            cache.get('directions_full'),
+            cache.get('speed_values_full'),
+            cache.get('main_speed_values_full'),
+            cache.get('main_directions_full'),
+            cache.get('show_diff_vector', True),
+        )
 
     def run(self):
-        """Run method that performs all the real work"""
-
-        # Create the dialog with elements (after translation) and keep reference
-        # Only create GUI ONCE in callback, so that it will only load when the plugin is started
+        # 保持原本的 run 函式邏輯，只需確保縮排正確
         if self.first_start == True:
             self.first_start = False
             try:
                 self.dlg = S111ViewerDialog()
-                
-                # 初始化多檔案讀取器
                 self.multi_reader = S111MultiFileReader()
-                
-                # 檢查依賴
                 self.check_dependencies()
-                
-                # 設置對話框並添加額外控件
                 self.setup_dialog()
                 
-                # 連接按鈕信號
-                print("連接界面按鈕...")
-                if hasattr(self.dlg, 'btnBrowse'):
-                    self.dlg.btnBrowse.clicked.connect(self.select_files)
-                    print("已連接瀏覽按鈕（多檔案模式）")
-                else:
-                    print("警告: 找不到 btnBrowse 按鈕")
-                    
-                if hasattr(self.dlg, 'btnPlay'):
-                    self.dlg.btnPlay.clicked.connect(self.start_animation)
-                    print("已連接播放按鈕")
-                else:
-                    print("警告: 找不到 btnPlay 按鈕")
-                    
-                if hasattr(self.dlg, 'btnPause'):
-                    self.dlg.btnPause.clicked.connect(self.pause_animation)
-                    print("已連接暫停按鈕")
-                else:
-                    print("警告: 找不到 btnPause 按鈕")
-                    
-                if hasattr(self.dlg, 'btnStop'):
-                    self.dlg.btnStop.clicked.connect(self.stop_animation)
-                    print("已連接停止按鈕")
-                else:
-                    print("警告: 找不到 btnStop 按鈕")
-                
-                # --- NEW: Connect signals for the new QDateTimeEdit widgets ---
-                if hasattr(self.dlg, 'dtStartTime') and hasattr(self.dlg, 'dtEndTime'):
-                    # Trigger the update_time_range function when the user changes the time
+                # 連接信號
+                if hasattr(self.dlg, 'btnBrowse'): self.dlg.btnBrowse.clicked.connect(self.select_files)
+                if hasattr(self.dlg, 'btnPlay'): self.dlg.btnPlay.clicked.connect(self.start_animation)
+                if hasattr(self.dlg, 'btnPause'): self.dlg.btnPause.clicked.connect(self.pause_animation)
+                if hasattr(self.dlg, 'btnStop'): self.dlg.btnStop.clicked.connect(self.stop_animation)
+                if hasattr(self.dlg, 'btnLoadComparison'): self.dlg.btnLoadComparison.clicked.connect(self.evaluate_model_uncertainty)
+                if hasattr(self.dlg, 'btnLoadFromDB'): self.dlg.btnLoadFromDB.clicked.connect(self.load_hotspots_from_db)
+                # 成果包模式信號連接
+                if hasattr(self.dlg, 'btnBrowseManifest'): self.dlg.btnBrowseManifest.clicked.connect(self.browse_manifest)
+                if hasattr(self.dlg, 'btnLoadResultPackage'): self.dlg.btnLoadResultPackage.clicked.connect(self.load_result_package)
+                if hasattr(self.dlg, 'dtStartTime'):
                     self.dlg.dtStartTime.dateTimeChanged.connect(self.update_time_range)
                     self.dlg.dtEndTime.dateTimeChanged.connect(self.update_time_range)
-                    print("已連接開始/結束時間選擇器")
-                else:
-                    print("警告: 找不到 dtStartTime 或 dtEndTime 元件")
-                    
-                # --- Connect animation interval dropdown ---
-                if hasattr(self.dlg, 'comboBox'):
-                    self.dlg.comboBox.currentTextChanged.connect(self.update_time_range)
-                    print("已連接動畫間隔選擇器 (comboBox)")
-                else:
-                    print("警告: 找不到 comboBox 元件")
-                    
-                if hasattr(self.dlg, 'sliderTime'):
-                    self.dlg.sliderTime.valueChanged.connect(self.update_time_display)
-                    print("已連接時間滑塊")
-                else:
-                    print("警告: 找不到 sliderTime 滑塊")
-                    
-                if hasattr(self.dlg, 'spinArrowSize_2'):
-                    self.dlg.spinArrowSize_2.valueChanged.connect(self.update_arrow_size)
-                    print("已連接箭頭大小微調框 (spinArrowSize_2)")
-                elif hasattr(self.dlg, 'spinArrowSize'):
-                    self.dlg.spinArrowSize.valueChanged.connect(self.update_arrow_size)
-                    print("已連接箭頭大小微調框 (spinArrowSize)")
-                else:
-                    print("警告: 找不到箭頭大小微調框")
-                    
+                if hasattr(self.dlg, 'comboBox'): self.dlg.comboBox.currentTextChanged.connect(self.update_time_range)
+                if hasattr(self.dlg, 'sliderTime'): self.dlg.sliderTime.valueChanged.connect(self.update_time_display)
+                if hasattr(self.dlg, 'spinArrowSize_2'): self.dlg.spinArrowSize_2.valueChanged.connect(self.update_arrow_size)
+                elif hasattr(self.dlg, 'spinArrowSize'): self.dlg.spinArrowSize.valueChanged.connect(self.update_arrow_size)
+                # 連接 OK 按鈕 -> 關閉視窗 (accept)
             except Exception as e:
                 import traceback
                 print(f"初始化插件時出錯: {e}")
-                print(traceback.format_exc())
+                traceback.print_exc()
                 return
 
-        # show the dialog
+        if not self._scale_signal_connected:
+            try:
+                self.iface.mapCanvas().scaleChanged.connect(self._on_scale_changed)
+                self._scale_signal_connected = True
+            except Exception as e:
+                print(f"[Scale Sync] 連接 scaleChanged 失敗: {e}")
+
         self.dlg.show()
 
     def remove_old_layers(self):
-        """移除本插件加進來的所有圖層"""
-        # 現在只需要移除固定圖層
         self.clear_layers()
+
+    # ========================================
+    # 成果包模式 Result Package Methods
+    # ========================================
+
+    def browse_manifest(self):
+        """開啟檔案對話框選取 manifest.json 或成果包 GeoJSON。"""
+        path, _ = QFileDialog.getOpenFileName(
+            self.dlg,
+            "選擇成果包 manifest.json / GeoJSON",
+            "",
+            "GeoJSON Files (*.geojson);;Result Package Files (*.json *.geojson);;All Files (*)"
+        )
+        if not path:
+            return
+        self.dlg.txtManifestPath.setText(path)
+        self._on_result_package_source_selected(path)
+
+    def _on_result_package_source_selected(self, source_path):
+        source_lower = source_path.lower()
+        if source_lower.endswith(".geojson"):
+            self._on_result_package_geojson_selected(source_path)
+            return
+        self._on_manifest_selected(source_path)
+
+    def _on_manifest_selected(self, manifest_path):
+        """解析 manifest，更新日期標籤與 comboOffset 可用選項。"""
+        try:
+            from .result_package_loader import load_manifest
+        except ImportError:
+            try:
+                from result_package_loader import load_manifest
+            except ImportError:
+                QMessageBox.critical(self.dlg, "錯誤", "找不到 result_package_loader 模組。")
+                return
+
+        manifest = load_manifest(manifest_path)
+        if not manifest:
+            self.dlg.lblPackageDate.setText("日期：（無法讀取 manifest）")
+            return
+
+        # 顯示日期
+        date_str = manifest.get("date", manifest.get("hindcast_date", "—"))
+        self.dlg.lblPackageDate.setText(f"日期：{date_str}")
+
+        # 更新 comboOffset：根據 manifest["files"]["spatial_stats"] 的 keys
+        files_node = manifest.get("files", {})
+        ss_node = files_node.get("spatial_stats", {})
+        available_offsets = sorted(ss_node.keys(), key=lambda x: int(x) if x.isdigit() else 0)
+
+        combo = self.dlg.comboOffset
+        combo.blockSignals(True)
+        combo.clear()
+        if available_offsets:
+            for key in available_offsets:
+                combo.addItem(f"{key}h")
+        else:
+            # manifest 沒有 spatial_stats 分段，預設三個
+            for h in ("24h", "48h", "72h"):
+                combo.addItem(h)
+        combo.blockSignals(False)
+
+        print(f"[成果包] manifest 載入完成：日期={date_str}，可用 offset={available_offsets}")
+
+    def _result_package_geojson_offset(self, geojson_path):
+        import re as _re
+
+        match = _re.search(r"_(\d+)h(?:\.geojson)?$", os.path.basename(geojson_path), _re.IGNORECASE)
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except (TypeError, ValueError):
+            return None
+
+    def _load_result_package_manifest_if_present(self, source_path):
+        try:
+            from .result_package_loader import load_manifest
+        except ImportError:
+            try:
+                from result_package_loader import load_manifest
+            except ImportError:
+                return {}
+
+        package_dir = os.path.dirname(os.path.abspath(source_path))
+        manifest_path = os.path.join(package_dir, "manifest.json")
+        if not os.path.isfile(manifest_path):
+            return {}
+        return load_manifest(manifest_path) or {}
+
+    def _on_result_package_geojson_selected(self, geojson_path):
+        """選取 spatial/hotspot GeoJSON 時，更新 UI 狀態。"""
+        manifest = self._load_result_package_manifest_if_present(geojson_path)
+        date_str = (
+            manifest.get("date")
+            or manifest.get("hindcast_date")
+            or os.path.basename(os.path.dirname(os.path.abspath(geojson_path)))
+        )
+        self.dlg.lblPackageDate.setText(f"日期：{date_str}（GeoJSON）")
+
+        basename = os.path.basename(geojson_path).lower()
+        combo = self.dlg.comboOffset
+        combo.blockSignals(True)
+        combo.clear()
+
+        if "_spatial_stats_" in basename:
+            offset_hours = self._result_package_geojson_offset(geojson_path)
+            if offset_hours is not None:
+                combo.addItem(f"{offset_hours}h")
+            else:
+                combo.addItem("—")
+            if hasattr(self.dlg, 'chkLoadSpatialStats'):
+                self.dlg.chkLoadSpatialStats.setChecked(True)
+            if hasattr(self.dlg, 'chkLoadHotspots'):
+                self.dlg.chkLoadHotspots.setChecked(False)
+        elif basename.endswith("_hotspots.geojson"):
+            combo.addItem("—")
+            if hasattr(self.dlg, 'chkLoadSpatialStats'):
+                self.dlg.chkLoadSpatialStats.setChecked(False)
+            if hasattr(self.dlg, 'chkLoadHotspots'):
+                self.dlg.chkLoadHotspots.setChecked(True)
+        else:
+            combo.addItem("—")
+
+        combo.blockSignals(False)
+        print(f"[成果包] GeoJSON 載入完成：{geojson_path}")
+
+    def load_result_package(self):
+        """從選取的 manifest.json 或 GeoJSON 載入成果包圖層。"""
+        source_path = self.dlg.txtManifestPath.text().strip()
+        if not source_path:
+            QMessageBox.warning(self.dlg, "成果包模式", "請先選取 manifest.json 或 GeoJSON 檔案。")
+            return
+
+        try:
+            from .result_package_loader import load_manifest, load_hotspots, load_spatial_stats
+        except ImportError:
+            try:
+                from result_package_loader import load_manifest, load_hotspots, load_spatial_stats
+            except ImportError:
+                QMessageBox.critical(self.dlg, "錯誤", "找不到 result_package_loader 模組。")
+                return
+
+        load_hs = self.dlg.chkLoadHotspots.isChecked()
+        load_ss = self.dlg.chkLoadSpatialStats.isChecked()
+
+        if not load_hs and not load_ss:
+            QMessageBox.information(self.dlg, "成果包模式", "請至少勾選一種資料類型（Hotspots / Spatial Stats）。")
+            return
+
+        if source_path.lower().endswith(".geojson"):
+            basename = os.path.basename(source_path).lower()
+            manifest = self._load_result_package_manifest_if_present(source_path)
+            date_str = str(manifest.get("hindcast_date", "")).strip() or \
+                str(manifest.get("date", "")).strip() or \
+                os.path.basename(os.path.dirname(os.path.abspath(source_path))) or "UnknownDate"
+            loaded_any = False
+
+            if "_spatial_stats_" in basename:
+                offset_hours = self._result_package_geojson_offset(source_path)
+                if offset_hours is None:
+                    QMessageBox.warning(self.dlg, "成果包模式", "無法從 GeoJSON 檔名解析 offset。")
+                    return
+                if load_ss:
+                    created = self._create_result_package_spatial_sidecar_layers_from_geojson(
+                        source_path,
+                        date_str,
+                        offset_hours,
+                    )
+                    if created > 0:
+                        loaded_any = True
+                    print(f"[成果包] SpatialStats {offset_hours}h：以 GeoJSON + QML 建立 {created} 個圖層")
+
+            elif basename.endswith("_hotspots.geojson"):
+                if load_hs:
+                    created = self._create_result_package_hotspot_sidecar_layer_from_geojson(
+                        source_path,
+                        date_str,
+                    )
+                    if created > 0:
+                        loaded_any = True
+                    print(f"[成果包] Hotspots：以 GeoJSON + QML 建立 {created} 個圖層")
+            else:
+                QMessageBox.warning(
+                    self.dlg,
+                    "成果包模式",
+                    "目前只支援直接載入 *_spatial_stats_*.geojson 或 *_hotspots.geojson。",
+                )
+                return
+
+            if loaded_any:
+                QMessageBox.information(
+                    self.dlg,
+                    "成果包模式",
+                    "GeoJSON 載入完成。\n請查看 QGIS 圖層面板。"
+                )
+            else:
+                QMessageBox.warning(
+                    self.dlg,
+                    "成果包模式",
+                    "載入完成，但沒有建立任何圖層。\n請確認 GeoJSON 與對應 QML 是否存在。"
+                )
+            return
+
+        manifest = load_manifest(source_path)
+        date_str = str(manifest.get("hindcast_date", "")).strip() or "UnknownDate"
+
+        # 取得 offset 小時數
+        offset_text = self.dlg.comboOffset.currentText()  # e.g. "24h"
+        try:
+            offset_hours = int(offset_text.replace("h", "").strip())
+        except ValueError:
+            QMessageBox.warning(self.dlg, "成果包模式", f"無法解析 offset：{offset_text}")
+            return
+
+        loaded_any = False
+
+        # ── 載入 Hotspots ──
+        if load_hs:
+            rows = load_hotspots(source_path, offset_hours=offset_hours)
+            if rows:
+                created = self._create_result_package_hotspot_layer(
+                    rows,
+                    layer_name=f"{date_str} Hotspots {offset_hours}h",
+                    layer_key=f"{date_str}_hotspots_{offset_hours}",
+                )
+                if created > 0:
+                    loaded_any = True
+                print(f"[成果包] Hotspots {offset_hours}h：建立 {created} 個圖層（來源 {len(rows)} 筆）")
+            else:
+                print(f"[成果包] Hotspots {offset_hours}h：無資料")
+
+            metric_created = self._create_result_package_metric_hotspot_sidecar_layers(
+                source_path,
+                manifest,
+                date_str,
+                offset_hours,
+            )
+            if metric_created > 0:
+                loaded_any = True
+                print(f"[成果包] Metric Hotspots {offset_hours}h：以 GeoJSON + QML 建立 {metric_created} 個圖層")
+
+        # ── 載入 Spatial Stats ──
+        if load_ss:
+            created = self._create_result_package_spatial_sidecar_layers(
+                source_path,
+                manifest,
+                date_str,
+                offset_hours,
+            )
+            if created > 0:
+                loaded_any = True
+                print(f"[成果包] SpatialStats {offset_hours}h：以 GeoJSON + QML 建立 {created} 個圖層")
+            else:
+                rows = load_spatial_stats(source_path, offset_hours=offset_hours)
+                if rows:
+                    created = self._create_result_package_spatial_layers(rows, date_str, offset_hours)
+                    if created > 0:
+                        loaded_any = True
+                    print(f"[成果包] SpatialStats {offset_hours}h：建立 {created} 個圖層（來源 {len(rows)} 筆）")
+                else:
+                    print(f"[成果包] SpatialStats {offset_hours}h：無資料")
+
+        if loaded_any:
+            QMessageBox.information(
+                self.dlg,
+                "成果包模式",
+                f"成果包載入完成（offset={offset_hours}h）。\n請查看 QGIS 圖層面板。"
+            )
+        else:
+            QMessageBox.warning(
+                self.dlg,
+                "成果包模式",
+                f"載入完成，但 offset={offset_hours}h 沒有可用資料。\n"
+                "請確認 manifest.json / GeoJSON 路徑與成果包檔案是否存在。"
+            )
+
+    def _build_result_package_hotspot_inner_svg_path(self, svg_path, css_content):
+        import re as _re
+        import tempfile
+
+        if not os.path.exists(svg_path):
+            return None
+
+        with open(svg_path, 'r', encoding='utf-8') as handle:
+            svg_raw = handle.read()
+        svg_processed = _re.sub(r'<\?xml-stylesheet.*?\?>', '', svg_raw)
+        svg_processed = _re.sub(r'<path[^>]*class="[^"]*sCHBLK[^"]*"[^>]*/>\s*', '', svg_processed, count=1)
+        style_element = f'<style type="text/css"><![CDATA[\n{css_content}\n]]></style>'
+        match = _re.search(r'<svg[^>]*>', svg_processed)
+        svg_final = (
+            svg_processed[:match.end()] + style_element + svg_processed[match.end():]
+            if match else style_element + svg_processed
+        )
+
+        tmp_svg = tempfile.NamedTemporaryFile(mode='w', suffix='.svg', delete=False, encoding='utf-8')
+        tmp_svg.write(svg_final)
+        tmp_svg.close()
+        return tmp_svg.name
+
+    def _build_result_package_hotspot_outline_svg_path(self, svg_path, outline_color):
+        import re as _re
+        import tempfile
+
+        if not os.path.exists(svg_path):
+            return None
+
+        with open(svg_path, 'r', encoding='utf-8') as handle:
+            svg_raw = handle.read()
+        svg_processed = _re.sub(r'<\?xml-stylesheet.*?\?>', '', svg_raw)
+        svg_processed = _re.sub(r'<path[^>]*class="[^"]*sCHBLK[^"]*"[^>]*/>\s*', '', svg_processed, count=1)
+        svg_processed = _re.sub(
+            r'class="fSCBN\d+"',
+            (
+                f'fill="none" stroke="{outline_color}" stroke-opacity="1" '
+                f'stroke-width="0.6" stroke-linecap="round" stroke-linejoin="round"'
+            ),
+            svg_processed,
+            count=1
+        )
+
+        tmp_svg = tempfile.NamedTemporaryFile(mode='w', suffix='.svg', delete=False, encoding='utf-8')
+        tmp_svg.write(svg_processed)
+        tmp_svg.close()
+        return tmp_svg.name
+
+    def _build_result_package_hotspot_renderer(self, fill_color):
+        base_size = 6.0
+        size_expr = f"""
+        CASE
+            WHEN "speed" <= {S111Standards.SLOW} THEN {base_size} * {S111Standards.SCALE_FLOOR}
+            WHEN "speed" >= {S111Standards.SHIGH} THEN {base_size} * {S111Standards.SCALE_CEILING}
+            ELSE {base_size} * ("speed" * {S111Standards.SCALE_FACTOR_INTERMEDIATE})
+        END
+        """
+        svg_path = self._build_result_package_spatial_svg_path(fill_color, "#000000")
+        if not svg_path:
+            fallback_symbol = QgsMarkerSymbol.createSimple({
+                'name': 'square',
+                'color': fill_color,
+                'outline_color': fill_color,
+                'size': '3',
+                'size_unit': 'MM',
+            })
+            return QgsSingleSymbolRenderer(fallback_symbol)
+
+        symbol = QgsMarkerSymbol()
+        if symbol.symbolLayerCount() > 0:
+            symbol.deleteSymbolLayer(0)
+
+        legend_layer = QgsSimpleMarkerSymbolLayer.create({
+            'name': 'square',
+            'color': fill_color,
+            'outline_color': fill_color,
+            'outline_width': '0.1',
+        })
+        if legend_layer is not None:
+            legend_layer.setSize(3.5)
+            legend_layer.setSizeUnit(QgsUnitTypes.RenderMillimeters)
+            legend_layer.setDataDefinedProperty(
+                QgsSymbolLayer.PropertySize,
+                QgsProperty.fromExpression("0")
+            )
+            symbol.appendSymbolLayer(legend_layer)
+
+        arrow_layer = QgsSvgMarkerSymbolLayer(svg_path)
+        arrow_layer.setSize(0.0)
+        arrow_layer.setSizeUnit(QgsUnitTypes.RenderMillimeters)
+        arrow_layer.setDataDefinedProperty(
+            QgsSymbolLayer.PropertySize,
+            QgsProperty.fromExpression(size_expr)
+        )
+        arrow_layer.setDataDefinedProperty(
+            QgsSymbolLayer.PropertyAngle,
+            QgsProperty.fromExpression('"direction"')
+        )
+        symbol.appendSymbolLayer(arrow_layer)
+
+        return QgsSingleSymbolRenderer(symbol)
+
+    def _create_result_package_hotspot_layer(self, rows, layer_name, layer_key):
+        """
+        依 severity 拆成 warning / critical 兩個成果包 hotspot 圖層，
+        並沿用原本 hotspot 的 S-111 箭頭樣式。
+        """
+        legacy_layer = self.uncertainty_hotspot_layers.pop(layer_key, None)
+        if legacy_layer and legacy_layer.isValid():
+            try:
+                QgsProject.instance().removeMapLayer(legacy_layer.id())
+            except Exception:
+                pass
+
+        severity_specs = [
+            ('warning', HOTSPOT_WARNING_COLOR, '0.5-1.0 kn'),
+            ('critical', HOTSPOT_CRITICAL_COLOR, '>= 1.0 kn'),
+        ]
+        created = 0
+
+        def _float_or_none(value):
+            try:
+                return float(value) if value is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        speed_rows = [
+            row for row in rows
+            if str(row.get("error_type", "speed")).lower() == "speed"
+        ]
+
+        for severity_key, outline_color, severity_label in severity_specs:
+            severity_layer_key = f"{layer_key}_{severity_key}"
+            old_layer = self.uncertainty_hotspot_layers.get(severity_layer_key)
+            if old_layer and old_layer.isValid():
+                try:
+                    QgsProject.instance().removeMapLayer(old_layer.id())
+                except Exception:
+                    pass
+
+            severity_rows = [
+                row for row in speed_rows
+                if str(row.get("severity", "")).lower() == severity_key
+            ]
+            if not severity_rows:
+                continue
+
+            title = f"{layer_name} ({severity_label})"
+            layer = QgsVectorLayer("Point?crs=EPSG:4326", title, "memory")
+            provider = layer.dataProvider()
+            provider.addAttributes([
+                QgsField("lon", QVariant.Double),
+                QgsField("lat", QVariant.Double),
+                QgsField("error_value", QVariant.Double),
+                QgsField("severity", QVariant.String),
+                QgsField("speed", QVariant.Double),
+                QgsField("direction", QVariant.Double),
+            ])
+            layer.updateFields()
+            layer.setRenderer(self._build_result_package_hotspot_renderer(outline_color))
+
+            features = []
+            for row in severity_rows:
+                lon = row.get("lon")
+                lat = row.get("lat")
+                if lon is None or lat is None:
+                    continue
+                try:
+                    lon_f = float(lon)
+                    lat_f = float(lat)
+                except (TypeError, ValueError):
+                    continue
+
+                feat = QgsFeature(layer.fields())
+                feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon_f, lat_f)))
+                feat.setAttributes([
+                    lon_f,
+                    lat_f,
+                    _float_or_none(row.get("error_value")),
+                    severity_key,
+                    _float_or_none(row.get("speed")) or 0.0,
+                    _float_or_none(row.get("direction")) or 0.0,
+                ])
+                features.append(feat)
+
+            if not features:
+                continue
+
+            provider.addFeatures(features)
+            layer.updateExtents()
+            QgsProject.instance().addMapLayer(layer)
+            self.uncertainty_hotspot_layers[severity_layer_key] = layer
+            created += 1
+            print(f"[成果包] 圖層 '{title}' 建立完成，共 {len(features)} 個點")
+
+        return created
+
+    def load_hotspots_from_db(self):
+        """從 PostgreSQL 讀取最新熱點，分別繪製流速與流向圖層。"""
+        try:
+            import psycopg2
+        except ImportError:
+            QMessageBox.warning(self.dlg, '資料庫', '請先安裝 psycopg2：\npip install psycopg2-binary')
+            return
+
+        conn = None
+        try:
+            conn = psycopg2.connect(**self.DB_CONFIG)
+        except Exception as exc:
+            QMessageBox.warning(self.dlg, '資料庫連線失敗', str(exc))
+            return
+
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT DISTINCT ON (forecast_lead_hours)
+                        target_date, target_timestamp, forecast_lead_hours,
+                        forecast_file, rmse, bias, max_error, threshold,
+                        dir_rmse, dir_bias, dir_max_error, dir_threshold
+                    FROM verification_summary_stats
+                    ORDER BY forecast_lead_hours, target_date DESC, target_timestamp DESC
+                """)
+                rows = cur.fetchall()
+
+                if not rows:
+                    QMessageBox.information(self.dlg, '資料庫', '資料庫中尚無驗證結果')
+                    return
+
+                lines = [
+                    "=" * 46,
+                    "  資料庫驗證結果（最新）",
+                    "=" * 46,
+                    f"  後報日期   : {rows[0][0]}",
+                    f"  目標時間   : {rows[0][1]}",
+                    "-" * 46,
+                ]
+                label_map = {24: '24h 預報', 48: '48h 預報', 72: '72h 預報'}
+                for row in rows:
+                    (
+                        _target_date, _target_timestamp, offset_h, fc_file,
+                        rmse, bias, max_e, threshold,
+                        dir_rmse, dir_bias, dir_max_err, dir_threshold
+                    ) = row
+                    lines += [
+                        f"  [{label_map.get(offset_h, f'{offset_h}h')}]  {fc_file}",
+                        f"    RMSE       : {rmse:.4f} 節",
+                        f"    偏差       : {bias:+.4f} 節",
+                        f"    最大誤差   : {max_e:.4f} 節",
+                        f"    Warning threshold : {threshold:.4f} 節",
+                        (
+                            f"    流向 RMSE    : {dir_rmse:.2f}°"
+                            if dir_rmse is not None else
+                            "    流向 RMSE    : N/A"
+                        ),
+                        (
+                            f"    流向偏差     : {dir_bias:+.2f}°"
+                            if dir_bias is not None else
+                            "    流向偏差     : N/A"
+                        ),
+                        (
+                            f"    流向最大誤差 : {dir_max_err:.2f}°"
+                            if dir_max_err is not None else
+                            "    流向最大誤差 : N/A"
+                        ),
+                        (
+                            f"    流向 hotspot threshold : {float(dir_threshold):.2f}°"
+                            if dir_threshold is not None else
+                            "    流向 hotspot threshold : N/A"
+                        ),
+                        "",
+                    ]
+                lines.append("=" * 46)
+                if hasattr(self.dlg, 'txtMetadata'):
+                    self.dlg.txtMetadata.setText('\n'.join(lines))
+
+                for key in list(self.uncertainty_hotspot_layers.keys()):
+                    if isinstance(key, tuple) and len(key) == 2 and key[1] in ('speed', 'direction'):
+                        layer = self.uncertainty_hotspot_layers.pop(key, None)
+                        if layer and layer.isValid():
+                            try:
+                                QgsProject.instance().removeMapLayer(layer.id())
+                            except Exception:
+                                pass
+
+                offset_map = {24: 1, 48: 2, 72: 3}
+                for row in rows:
+                    target_date, target_timestamp, offset_h, _fc_file, *_rest = row
+                    for error_type in ('speed', 'direction'):
+                        cur.execute("""
+                            SELECT lon, lat, error_value
+                            FROM verification_hotspot_points
+                            WHERE target_date = %s
+                              AND target_timestamp = %s
+                              AND forecast_lead_hours = %s
+                              AND error_type = %s
+                        """, (target_date, target_timestamp, offset_h, error_type))
+                        hotspot_rows = cur.fetchall()
+                        if not hotspot_rows:
+                            continue
+
+                        lons = [float(item[0]) for item in hotspot_rows]
+                        lats = [float(item[1]) for item in hotspot_rows]
+                        errs = [float(item[2]) for item in hotspot_rows]
+                        self._draw_db_hotspot_layer(
+                            offset_map.get(offset_h, 1),
+                            lons,
+                            lats,
+                            errs,
+                            error_type=error_type,
+                        )
+                        print(f"[資料庫] {offset_h}h {error_type} 熱點：{len(hotspot_rows)} 個")
+
+        except Exception as exc:
+            QMessageBox.warning(self.dlg, '資料庫熱點載入失敗', str(exc))
+        finally:
+            if conn:
+                conn.close()
+
+    def _result_package_hotspot_severity(self, row, error_type):
+        severity = str(row.get("severity", "")).strip().lower()
+        if severity in ("warning", "critical"):
+            return severity
+
+        try:
+            error_value = float(row.get("error_value"))
+        except (TypeError, ValueError):
+            return ""
+
+        if error_type == "direction":
+            return "critical" if error_value >= DIR_HOTSPOT_CRITICAL_DEG else (
+                "warning" if error_value >= DIR_HOTSPOT_WARN_DEG else ""
+            )
+        return "critical" if error_value >= HOTSPOT_CRITICAL_KN else (
+            "warning" if error_value >= HOTSPOT_WARN_KN else ""
+        )
+
+    def _create_result_package_hotspot_layer(self, rows, layer_name, layer_key):
+        """建立成果包熱點圖層，分別繪製流速與流向 warning/critical。"""
+        for existing_key in list(self.uncertainty_hotspot_layers.keys()):
+            if existing_key == layer_key or (
+                isinstance(existing_key, str) and existing_key.startswith(f"{layer_key}_")
+            ):
+                layer = self.uncertainty_hotspot_layers.pop(existing_key, None)
+                if layer and layer.isValid():
+                    try:
+                        QgsProject.instance().removeMapLayer(layer.id())
+                    except Exception:
+                        pass
+
+        created = 0
+
+        def _float_or_none(value):
+            try:
+                return float(value) if value is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        hotspot_specs = {
+            "speed": [
+                ("warning", HOTSPOT_WARNING_COLOR, "Speed", "0.5-1.0 kn"),
+                ("critical", HOTSPOT_CRITICAL_COLOR, "Speed", ">= 1.0 kn"),
+            ],
+            "direction": [
+                ("warning", DIR_HOTSPOT_WARNING_COLOR, "Direction", "30-45°"),
+                ("critical", DIR_HOTSPOT_CRITICAL_COLOR, "Direction", ">= 45°"),
+            ],
+        }
+
+        for error_type, severity_specs in hotspot_specs.items():
+            typed_rows = [
+                row for row in rows
+                if str(row.get("error_type", "speed")).strip().lower() == error_type
+            ]
+            if not typed_rows:
+                continue
+
+            for severity_key, fill_color, type_label, severity_label in severity_specs:
+                severity_layer_key = f"{layer_key}_{error_type}_{severity_key}"
+                old_layer = self.uncertainty_hotspot_layers.get(severity_layer_key)
+                if old_layer and old_layer.isValid():
+                    try:
+                        QgsProject.instance().removeMapLayer(old_layer.id())
+                    except Exception:
+                        pass
+
+                severity_rows = [
+                    row for row in typed_rows
+                    if self._result_package_hotspot_severity(row, error_type) == severity_key
+                ]
+                if not severity_rows:
+                    continue
+
+                title = f"{layer_name} {type_label} ({severity_label})"
+                layer = QgsVectorLayer("Point?crs=EPSG:4326", title, "memory")
+                provider = layer.dataProvider()
+                provider.addAttributes([
+                    QgsField("lon", QVariant.Double),
+                    QgsField("lat", QVariant.Double),
+                    QgsField("error_value", QVariant.Double),
+                    QgsField("severity", QVariant.String),
+                    QgsField("error_type", QVariant.String),
+                    QgsField("speed", QVariant.Double),
+                    QgsField("direction", QVariant.Double),
+                ])
+                layer.updateFields()
+                layer.setRenderer(self._build_result_package_hotspot_renderer(fill_color))
+
+                features = []
+                for row in severity_rows:
+                    lon = row.get("lon")
+                    lat = row.get("lat")
+                    if lon is None or lat is None:
+                        continue
+                    try:
+                        lon_f = float(lon)
+                        lat_f = float(lat)
+                    except (TypeError, ValueError):
+                        continue
+
+                    feat = QgsFeature(layer.fields())
+                    feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon_f, lat_f)))
+                    feat.setAttributes([
+                        lon_f,
+                        lat_f,
+                        _float_or_none(row.get("error_value")),
+                        severity_key,
+                        error_type,
+                        _float_or_none(row.get("speed")) or 0.0,
+                        _float_or_none(row.get("direction")) or 0.0,
+                    ])
+                    features.append(feat)
+
+                if not features:
+                    continue
+
+                provider.addFeatures(features)
+                layer.updateExtents()
+                QgsProject.instance().addMapLayer(layer)
+                self.uncertainty_hotspot_layers[severity_layer_key] = layer
+                created += 1
+                print(f"[??? ?惜 '{title}' 撱箇?摰?嚗 {len(features)} ??")
+
+        return created
+
+    def _result_package_spatial_sidecar_suffix_map(self):
+        return {
+            "mean_abs_error": "mean",
+            "median_abs_error": "median",
+            "std_abs_error": "std",
+            "mean_abs_dir_error": "mean_dir",
+            "median_abs_dir_error": "median_dir",
+            "std_abs_dir_error": "std_dir",
+        }
+
+    def _result_package_spatial_metric_defs(self):
+        return [
+            ("mean_abs_error", "MeanAbsError", 0.5, 1.0, "0.5-1.0 kn", ">= 1.0 kn"),
+            ("median_abs_error", "MedianAbsError", 0.5, 1.0, "0.5-1.0 kn", ">= 1.0 kn"),
+            ("std_abs_error", "StdAbsError", 0.5, 1.0, "0.5-1.0 kn", ">= 1.0 kn"),
+            ("mean_abs_dir_error", "MeanAbsDirError", 22.5, 45.0, "22.5-45°", ">= 45°"),
+            ("median_abs_dir_error", "MedianAbsDirError", 22.5, 45.0, "22.5-45°", ">= 45°"),
+            ("std_abs_dir_error", "StdAbsDirError", 22.5, 45.0, "22.5-45°", ">= 45°"),
+        ]
+
+    def _selected_result_package_spatial_metric_defs(self):
+        metric_defs = self._result_package_spatial_metric_defs()
+        selection_map = {
+            "Mean Speed Error": "mean_abs_error",
+            "Median Speed Error": "median_abs_error",
+            "Std Speed Error": "std_abs_error",
+            "Mean Dir Error": "mean_abs_dir_error",
+            "Median Dir Error": "median_abs_dir_error",
+            "Std Dir Error": "std_abs_dir_error",
+            "All (6 layers)": None,
+        }
+
+        if not hasattr(self.dlg, 'comboSpatialMetric'):
+            return [metric_defs[0]]
+
+        current_text = self.dlg.comboSpatialMetric.currentText().strip()
+        selected_key = selection_map.get(current_text, "mean_abs_error")
+        if selected_key is None:
+            return metric_defs
+        return [metric_def for metric_def in metric_defs if metric_def[0] == selected_key]
+
+    def _result_package_spatial_auxiliary_style_path(self, geojson_path, suffix):
+        stem, _ = os.path.splitext(os.path.basename(geojson_path))
+        short_stem = stem.replace("_spatial_stats_", "_")
+        return os.path.join(os.path.dirname(geojson_path), f"{short_stem}.{suffix}.qml")
+
+    def _create_result_package_spatial_sidecar_layers(self, manifest_path, manifest, date_str, offset_hours):
+        """
+        優先讀取成果包中的 spatial GeoJSON 與六個 sidecar QML。
+        若 sidecar 不完整，回傳 0 讓呼叫端退回舊的 CSV/memory layer 載入流程。
+        """
+        files_node = manifest.get("files", {}) if isinstance(manifest, dict) else {}
+        geojson_map = files_node.get("spatial_stats_geojson", {}) if isinstance(files_node, dict) else {}
+        if not isinstance(geojson_map, dict):
+            return 0
+
+        geojson_name = geojson_map.get(str(offset_hours))
+        if not isinstance(geojson_name, str) or not geojson_name.strip():
+            return 0
+
+        package_dir = os.path.dirname(os.path.abspath(manifest_path))
+        geojson_path = os.path.join(package_dir, geojson_name)
+        if not os.path.isfile(geojson_path):
+            print(f"[成果包] 找不到 spatial GeoJSON：{geojson_path}")
+            return 0
+
+        return self._create_result_package_spatial_sidecar_layers_from_geojson(
+            geojson_path,
+            date_str,
+            offset_hours,
+        )
+
+    def _create_result_package_spatial_sidecar_layers_from_geojson(self, geojson_path, date_str, offset_hours):
+        """直接從 spatial_stats GeoJSON + 六個 sidecar QML 建立圖層。"""
+
+        metric_defs = [
+            (metric_key, layer_prefix)
+            for metric_key, layer_prefix, _warning_threshold, _critical_threshold, _warning_label, _critical_label
+            in self._selected_result_package_spatial_metric_defs()
+        ]
+        suffix_map = self._result_package_spatial_sidecar_suffix_map()
+
+        missing_paths = []
+        for metric_key, _layer_prefix in metric_defs:
+            qml_path = self._result_package_spatial_auxiliary_style_path(
+                geojson_path,
+                suffix_map[metric_key],
+            )
+            if not os.path.isfile(qml_path):
+                missing_paths.append(qml_path)
+
+        if missing_paths:
+            print("[成果包] 缺少 Spatial Stats sidecar QML，將 fallback 到舊路徑：")
+            for path in missing_paths:
+                print(f"  - {path}")
+            return 0
+
+        created = 0
+        for metric_key, layer_prefix in metric_defs:
+            layer_name = f"{date_str} {layer_prefix} {offset_hours}h"
+            layer_key = f"{date_str}_spatial_{metric_key}_{offset_hours}"
+            qml_path = self._result_package_spatial_auxiliary_style_path(
+                geojson_path,
+                suffix_map[metric_key],
+            )
+
+            old_layer = self.uncertainty_hotspot_layers.get(layer_key)
+            if old_layer and old_layer.isValid():
+                try:
+                    QgsProject.instance().removeMapLayer(old_layer.id())
+                except Exception:
+                    pass
+
+            layer = QgsVectorLayer(geojson_path, layer_name, "ogr")
+            if not layer.isValid():
+                print(f"[成果包] Spatial GeoJSON 圖層無效：{geojson_path}")
+                continue
+
+            try:
+                load_result = layer.loadNamedStyle(qml_path)
+                if isinstance(load_result, tuple):
+                    style_ok = bool(load_result[-1]) if len(load_result) > 1 else True
+                    style_msg = load_result[0] if load_result else ""
+                else:
+                    style_ok = bool(load_result)
+                    style_msg = ""
+            except Exception as exc:
+                print(f"[成果包] 載入 QML 失敗：{qml_path} ({exc})")
+                continue
+
+            if not style_ok:
+                print(f"[成果包] QML 套用失敗：{qml_path} {style_msg}")
+                continue
+
+            layer.setName(layer_name)
+            layer.triggerRepaint()
+            QgsProject.instance().addMapLayer(layer)
+            self.uncertainty_hotspot_layers[layer_key] = layer
+            created += 1
+            print(f"[成果包] 已載入 sidecar Spatial Layer：{layer_name}")
+
+        return created
+
+    def _create_result_package_hotspot_sidecar_layer_from_geojson(self, geojson_path, date_str):
+        """直接從 hotspots GeoJSON + sidecar QML 建立圖層。"""
+        qml_path = os.path.splitext(geojson_path)[0] + ".qml"
+        if not os.path.isfile(qml_path):
+            print(f"[成果包] 找不到 hotspot QML：{qml_path}")
+            return 0
+
+        layer_key = f"{date_str}_hotspots_geojson_{os.path.basename(geojson_path)}"
+        old_layer = self.uncertainty_hotspot_layers.get(layer_key)
+        if old_layer and old_layer.isValid():
+            try:
+                QgsProject.instance().removeMapLayer(old_layer.id())
+            except Exception:
+                pass
+
+        layer_name = f"{date_str} Hotspots"
+        layer = QgsVectorLayer(geojson_path, layer_name, "ogr")
+        if not layer.isValid():
+            print(f"[成果包] Hotspot GeoJSON 圖層無效：{geojson_path}")
+            return 0
+
+        try:
+            load_result = layer.loadNamedStyle(qml_path)
+            if isinstance(load_result, tuple):
+                style_ok = bool(load_result[-1]) if len(load_result) > 1 else True
+                style_msg = load_result[0] if load_result else ""
+            else:
+                style_ok = bool(load_result)
+                style_msg = ""
+        except Exception as exc:
+            print(f"[成果包] 載入 hotspot QML 失敗：{qml_path} ({exc})")
+            return 0
+
+        if not style_ok:
+            print(f"[成果包] Hotspot QML 套用失敗：{qml_path} {style_msg}")
+            return 0
+
+        layer.setName(layer_name)
+        layer.triggerRepaint()
+        QgsProject.instance().addMapLayer(layer)
+        self.uncertainty_hotspot_layers[layer_key] = layer
+        print(f"[成果包] 已載入 sidecar Hotspot Layer：{layer_name}")
+        return 1
+
+    def _create_result_package_spatial_layers(self, rows, date_str, offset_hours):
+        """
+        將 spatial_stats rows 建成六個統計圖層：
+        - 流速誤差：Mean / Median / Std
+        - 流向誤差：Mean / Median / Std
+        """
+        metric_defs = self._selected_result_package_spatial_metric_defs()
+
+        created = 0
+        for metric_key, layer_prefix, warning_threshold, critical_threshold, warning_label, critical_label in metric_defs:
+            layer = self._create_result_package_spatial_metric_layer(
+                rows,
+                metric_key=metric_key,
+                layer_name=f"{date_str} {layer_prefix} {offset_hours}h",
+                layer_key=f"{date_str}_spatial_{metric_key}_{offset_hours}",
+            )
+            if layer is not None:
+                created += 1
+        return created
+
+    def _create_result_package_metric_hotspot_sidecar_layers(self, manifest_path, manifest, date_str, offset_hours):
+        """從成果包 manifest 載入指定 lead time 的 mean/median/std HOTSPOT GeoJSON。"""
+        files_section = manifest.get("files", {}) if isinstance(manifest, dict) else {}
+        metric_geojson = files_section.get("hotspot_metric_geojson", {})
+        offset_files = metric_geojson.get(str(offset_hours), {}) if isinstance(metric_geojson, dict) else {}
+        if not isinstance(offset_files, dict) or not offset_files:
+            return 0
+
+        package_dir = os.path.dirname(os.path.abspath(manifest_path))
+        metric_order = ["mean", "median", "std", "mean_dir", "median_dir", "std_dir"]
+        metric_labels = {
+            "mean": "Mean Speed",
+            "median": "Median Speed",
+            "std": "Std Speed",
+            "mean_dir": "Mean Direction",
+            "median_dir": "Median Direction",
+            "std_dir": "Std Direction",
+        }
+        created = 0
+
+        for metric_key in metric_order:
+            filename = offset_files.get(metric_key)
+            if not isinstance(filename, str) or not filename:
+                continue
+            geojson_path = os.path.join(package_dir, filename)
+            if not os.path.isfile(geojson_path):
+                print(f"[成果包] 找不到 metric hotspot GeoJSON：{geojson_path}")
+                continue
+
+            label = metric_labels.get(metric_key, metric_key)
+            created += self._create_result_package_hotspot_sidecar_layer_from_geojson(
+                geojson_path,
+                f"{date_str} {offset_hours}h {label}",
+            )
+
+        return created
+
+    def _load_result_package_hotspot_rows_from_geojson(self, geojson_path):
+        rows = []
+        try:
+            with open(geojson_path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except Exception as exc:
+            print(f"[成果包] Hotspot GeoJSON 讀取失敗：{geojson_path} ({exc})")
+            return rows
+
+        for feature in payload.get("features", []):
+            if not isinstance(feature, dict):
+                continue
+            geometry = feature.get("geometry") or {}
+            properties = feature.get("properties") or {}
+            coordinates = geometry.get("coordinates") or []
+            if geometry.get("type") != "Point" or len(coordinates) < 2:
+                continue
+            row = dict(properties)
+            row.setdefault("lon", coordinates[0])
+            row.setdefault("lat", coordinates[1])
+            rows.append(row)
+        return rows
+
+    def _create_result_package_hotspot_sidecar_layer_from_geojson(self, geojson_path, date_str):
+        """直接從 hotspots GeoJSON 建立 speed/direction 熱點圖層。"""
+        layer_key = f"{date_str}_hotspots_geojson_{os.path.basename(geojson_path)}"
+        rows = self._load_result_package_hotspot_rows_from_geojson(geojson_path)
+        if not rows:
+            print(f"[成果包] Hotspot GeoJSON 圖層無效：{geojson_path}")
+            return 0
+        created = self._create_result_package_hotspot_layer(
+            rows,
+            layer_name=f"{date_str} Hotspots",
+            layer_key=layer_key,
+        )
+        print(f"[成果包] 已建立 GeoJSON Hotspot 圖層：{os.path.basename(geojson_path)}")
+        return created
+
+    def _result_package_spatial_size_expression(self, speed_field="mean_truth_speed"):
+        base_size_mm = 10.0
+        return f"""
+            CASE
+                WHEN "{speed_field}" <= {S111Standards.SLOW} THEN {base_size_mm} * {S111Standards.SCALE_FLOOR}
+                WHEN "{speed_field}" >= {S111Standards.SHIGH} THEN {base_size_mm} * {S111Standards.SCALE_CEILING}
+                ELSE {base_size_mm} * ("{speed_field}" * {S111Standards.SCALE_FACTOR_INTERMEDIATE})
+            END
+        """
+
+    def _build_result_package_spatial_svg_path(self, fill_color, outline_color="#000000"):
+        import re as _re
+        import tempfile
+
+        svg_path = S111Standards.get_arrow_symbol_path(1)
+        if not os.path.exists(svg_path):
+            return None
+
+        with open(svg_path, "r", encoding="utf-8") as svg_file:
+            svg_text = svg_file.read()
+
+        svg_text = _re.sub(
+            r'<\?xml-stylesheet[^>]*\?>\s*',
+            '',
+            svg_text,
+            count=1,
+            flags=_re.IGNORECASE,
+        )
+        svg_text = _re.sub(
+            r'<path([^>]*)class="fSCBN\d+"([^>]*)/>',
+            lambda m: f'<path{m.group(1)}fill="{fill_color}"{m.group(2)}/>',
+            svg_text,
+            count=1,
+        )
+        svg_text = _re.sub(
+            r'<path([^>]*)class="sl f0 sCHBLK"([^>]*)/>',
+            lambda m: (
+                f'<path{m.group(1)}fill="none" stroke="{outline_color}" '
+                f'stroke-linecap="round" stroke-linejoin="round"{m.group(2)}/>'
+            ),
+            svg_text,
+            count=1,
+        )
+
+        target_path = os.path.join(
+            tempfile.gettempdir(),
+            f"s111_result_package_spatial_{fill_color.replace('#', '')}_{outline_color.replace('#', '')}.svg",
+        )
+        with open(target_path, "w", encoding="utf-8") as out_file:
+            out_file.write(svg_text)
+        return target_path
+
+    def _build_result_package_spatial_arrow_symbol(self, fill_color):
+        svg_path = self._build_result_package_spatial_svg_path(fill_color)
+        if not svg_path:
+            fallback = QgsMarkerSymbol.createSimple({
+                "name": "square",
+                "size": "1.6",
+                "color": fill_color,
+                "outline_color": fill_color,
+                "outline_width": "0.1",
+            })
+            return fallback
+
+        symbol = QgsMarkerSymbol()
+        if symbol.symbolLayerCount() > 0:
+            symbol.deleteSymbolLayer(0)
+
+        legend_layer = QgsSimpleMarkerSymbolLayer.create(
+            {
+                "name": "square",
+                "color": fill_color,
+                "outline_color": fill_color,
+                "outline_width": "0.1",
+            }
+        )
+        if legend_layer is not None:
+            legend_layer.setSize(3.5)
+            legend_layer.setSizeUnit(QgsUnitTypes.RenderMillimeters)
+            legend_layer.setDataDefinedProperty(
+                QgsSymbolLayer.PropertySize,
+                QgsProperty.fromExpression("0"),
+            )
+            symbol.appendSymbolLayer(legend_layer)
+
+        layer = QgsSvgMarkerSymbolLayer(svg_path)
+        layer.setSize(0.0)
+        layer.setSizeUnit(QgsUnitTypes.RenderMillimeters)
+        layer.setDataDefinedProperty(
+            QgsSymbolLayer.PropertyAngle,
+            QgsProperty.fromExpression('"mean_truth_direction"'),
+        )
+        layer.setDataDefinedProperty(
+            QgsSymbolLayer.PropertySize,
+            QgsProperty.fromExpression(
+                self._result_package_spatial_size_expression("mean_truth_speed")
+            ),
+        )
+        symbol.appendSymbolLayer(layer)
+        return symbol
+
+    def _result_package_percentile_field(self, metric_field):
+        mapping = {
+            "mean_abs_error": "mean_percentile",
+            "median_abs_error": "median_percentile",
+            "std_abs_error": "std_percentile",
+            "mean_abs_dir_error": "mean_dir_percentile",
+            "median_abs_dir_error": "median_dir_percentile",
+            "std_abs_dir_error": "std_dir_percentile",
+        }
+        return mapping.get(metric_field, metric_field)
+
+    def _result_package_interpolate_color(self, start_hex, end_hex, ratio):
+        start = QColor(start_hex)
+        end = QColor(end_hex)
+        return QColor(
+            int(round(start.red() + (end.red() - start.red()) * ratio)),
+            int(round(start.green() + (end.green() - start.green()) * ratio)),
+            int(round(start.blue() + (end.blue() - start.blue()) * ratio)),
+        )
+
+    def _result_package_percentile_color(self, percentile_value):
+        value = max(0.0, min(100.0, float(percentile_value)))
+        if value <= 50.0:
+            return self._result_package_interpolate_color("#FFFFFF", HOTSPOT_WARNING_COLOR, value / 50.0)
+        if value <= 75.0:
+            return self._result_package_interpolate_color(HOTSPOT_WARNING_COLOR, PERCENTILE_ORANGE_COLOR, (value - 50.0) / 25.0)
+        return self._result_package_interpolate_color(PERCENTILE_ORANGE_COLOR, HOTSPOT_CRITICAL_COLOR, (value - 75.0) / 25.0)
+
+    def _build_result_package_spatial_renderer(self, metric_field):
+        percentile_field = self._result_package_percentile_field(metric_field)
+        ranges = []
+        for lower in range(0, 100, 10):
+            upper = lower + 10
+            midpoint = lower + 5
+            color = self._result_package_percentile_color(midpoint).name()
+            symbol = QgsMarkerSymbol.createSimple({
+                "name": "square",
+                "color": color,
+                "outline_color": color,
+                "outline_width": "0.0",
+                "size": "1.5",
+                "size_unit": "MM",
+            })
+            ranges.append(QgsRendererRange(float(lower), float(upper), symbol, f"{lower}-{upper}%"))
+
+        return QgsGraduatedSymbolRenderer(percentile_field, ranges)
+
+    def _create_result_package_spatial_metric_layer(
+        self,
+        rows,
+        metric_key,
+        layer_name,
+        layer_key,
+    ):
+        """
+        建立單一 spatial metric 圖層，以 percentile 欄位做漸層上色。
+        """
+        old_layer = self.uncertainty_hotspot_layers.get(layer_key)
+        if old_layer and old_layer.isValid():
+            try:
+                QgsProject.instance().removeMapLayer(old_layer.id())
+            except Exception:
+                pass
+
+        layer = QgsVectorLayer("Point?crs=EPSG:4326", layer_name, "memory")
+        provider = layer.dataProvider()
+        percentile_field = self._result_package_percentile_field(metric_key)
+        provider.addAttributes([
+            QgsField("lon", QVariant.Double),
+            QgsField("lat", QVariant.Double),
+            QgsField(metric_key, QVariant.Double),
+            QgsField(percentile_field, QVariant.Double),
+            QgsField("forecast_issue_date", QVariant.String),
+            QgsField("mean_truth_speed", QVariant.Double),
+            QgsField("mean_truth_direction", QVariant.Double),
+            QgsField("valid_count", QVariant.Int),
+        ])
+        layer.updateFields()
+
+        features = []
+        for row in rows:
+            lon = row.get("lon")
+            lat = row.get("lat")
+            metric_val = row.get(metric_key)
+            percentile_val = row.get(percentile_field)
+            if lon is None or lat is None or metric_val is None or percentile_val is None:
+                continue
+            try:
+                lon_f = float(lon)
+                lat_f = float(lat)
+                metric_f = float(metric_val)
+                percentile_f = float(percentile_val)
+            except (TypeError, ValueError):
+                continue
+
+            if not np.isfinite(metric_f) or not np.isfinite(percentile_f):
+                continue
+
+            feat = QgsFeature(layer.fields())
+            feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon_f, lat_f)))
+            feat.setAttributes([
+                lon_f,
+                lat_f,
+                metric_f,
+                percentile_f,
+                str(row.get("forecast_issue_date", "")),
+                float(row.get("mean_truth_speed")) if row.get("mean_truth_speed") is not None else None,
+                float(row.get("mean_truth_direction")) if row.get("mean_truth_direction") is not None else None,
+                int(float(row.get("valid_count"))) if row.get("valid_count") is not None else None,
+            ])
+            features.append(feat)
+
+        if not features:
+            print(f"[成果包] 圖層 '{layer_name}' 無高於門檻的格點，略過建立")
+            return None
+
+        provider.addFeatures(features)
+        layer.updateExtents()
+        layer.setRenderer(
+            self._build_result_package_spatial_renderer(metric_key)
+        )
+
+        QgsProject.instance().addMapLayer(layer)
+        self.uncertainty_hotspot_layers[layer_key] = layer
+        print(f"[成果包] 圖層 '{layer_name}' 建立完成，共 {len(features)} 個點")
+        return layer
+
+    # ========================================
+    # S-102/S-104 Dynamic Bathymetry Methods（獨立功能，不影響 S-111）
+    # ========================================
+
+    def load_s102_file(self):
+        """載入 S-102 靜態水深檔案（獨立功能）"""
+        from qgis.PyQt.QtWidgets import QFileDialog
+
+        filepath, _ = QFileDialog.getOpenFileName(
+            self.dlg,
+            "選擇 S-102 水深檔案",
+            "",
+            "HDF5 Files (*.h5 *.hdf5);;All Files (*)"
+        )
+
+        if not filepath:
+            return
+
+        print(f"\n[S-102 載入] 開始載入檔案: {filepath}")
+        self.s102_filepath = filepath
+
+        # 初始化管理器（如果還沒有）
+        if self.bathymetry_manager is None:
+            self.bathymetry_manager = S102S104Renderer()
+
+        # 讀取 S-102 數據
+        depth_data = self.bathymetry_manager.read_s102_depth(filepath)
+
+        if depth_data is None:
+            QMessageBox.warning(
+                self.dlg,
+                "載入失敗",
+                "無法讀取 S-102 水深數據，請檢查檔案格式。"
+            )
+            return
+
+        # 如果沒有 S-104，直接使用 S-102 靜態深度
+        if self.s104_filepath is None:
+            print("[S-102] 無 S-104 檔案，使用靜態水深")
+            self.bathymetry_manager.adjusted_depth = depth_data
+        else:
+            # 重新計算動態水深
+            self.bathymetry_manager.calculate_dynamic_depth()
+
+        # 渲染到 QGIS
+        self._render_bathymetry_to_qgis()
+
+        QMessageBox.information(
+            self.dlg,
+            "載入成功",
+            f"成功載入 S-102 水深數據\n深度範圍: {np.nanmin(depth_data):.2f} 至 {np.nanmax(depth_data):.2f} 米"
+        )
+
+    def load_s104_file(self):
+        """載入 S-104 動態水位檔案（水位修正值）"""
+        from qgis.PyQt.QtWidgets import QFileDialog
+
+        filepath, _ = QFileDialog.getOpenFileName(
+            self.dlg,
+            "選擇 S-104 水位檔案",
+            "",
+            "HDF5 Files (*.h5 *.hdf5);;All Files (*)"
+        )
+
+        if not filepath:
+            return
+
+        print(f"\n[S-104 載入] 開始載入檔案: {filepath}")
+        self.s104_filepath = filepath
+
+        # 初始化管理器（如果還沒有）
+        if self.bathymetry_manager is None:
+            self.bathymetry_manager = S102S104Renderer()
+
+        # 讀取 S-104 數據
+        water_level_data = self.bathymetry_manager.read_s104_water_level(filepath)
+
+        if water_level_data is None:
+            QMessageBox.warning(
+                self.dlg,
+                "載入失敗",
+                "無法讀取 S-104 水位數據，請檢查檔案格式。"
+            )
+            return
+
+        # 檢查是否有底層 S-102 數據
+        if self.s102_filepath is None or self.bathymetry_manager.s102_depth is None:
+            # 無底層數據，只載入 S-104
+            print("[S-104] S-104 修正值已載入")
+            print("[S-104] （根據 IHO 規範，S-104 是修正值，需配合 S-102 底層數據）")
+            print("[S-104] 請再載入 S-102 以顯示動態調整後的水深")
+            QMessageBox.information(
+                self.dlg,
+                "S-104 載入成功",
+                "S-104 水位修正值已載入。\n\n根據 IHO 規範，S-104 需配合 S-102 底層數據使用。\n請再載入 S-102 檔案以顯示動態調整後的水深。"
+            )
+            return
+
+        # 有底層數據，執行動態調整
+        print("[S-104] 檢測到底層 S-102 數據，執行動態調整...")
+        adjusted_depth = self.bathymetry_manager.calculate_dynamic_depth()
+
+        if adjusted_depth is None:
+            QMessageBox.warning(
+                self.dlg,
+                "計算失敗",
+                "無法計算動態水深。詳細錯誤請查看 Console 輸出。"
+            )
+            return
+
+        # 重新渲染
+        self._render_bathymetry_to_qgis()
+
+        QMessageBox.information(
+            self.dlg,
+            "動態調整完成",
+            f"S-104 水位修正已套用至 S-102 底層數據。\n調整後深度範圍: {np.nanmin(adjusted_depth):.2f} 至 {np.nanmax(adjusted_depth):.2f} 米"
+        )
+
+    def _render_bathymetry_to_qgis(self):
+        """將 S-102/S-104 水深數據渲染到 QGIS（使用柵格圖層）"""
+        if self.bathymetry_manager is None or self.bathymetry_manager.adjusted_depth is None:
+            print("[渲染] 錯誤: 無可用的水深數據")
+            return
+
+        # 清除舊的水深圖層
+        self.clear_bathymetry_layer()
+
+        print("\n[QGIS 渲染] 創建柵格圖層...")
+
+        # 從 bathymetry_manager 取得渲染後的數據
+        depth_array = self.bathymetry_manager.adjusted_depth
+
+        # 創建記憶體柵格圖層
+        try:
+            from qgis.core import (
+                QgsRasterLayer, QgsRasterBandStats,
+                QgsSingleBandPseudoColorRenderer, QgsColorRampShader,
+                QgsRasterShader, QgsProject
+            )
+
+            # 使用 numpy 保存為臨時 GeoTIFF
+            import tempfile
+            from osgeo import gdal
+
+            # 創建臨時檔案
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.tif')
+            temp_path = temp_file.name
+            temp_file.close()
+
+            # 使用 GDAL 創建 GeoTIFF
+            driver = gdal.GetDriverByName('GTiff')
+            rows, cols = depth_array.shape
+            dataset = driver.Create(temp_path, cols, rows, 1, gdal.GDT_Float32)
+
+            # 設定地理參考（從 S-102 metadata 中讀取）
+            geotransform = self.bathymetry_manager.geotransform
+            if geotransform is None:
+                print("  ⚠ 警告: 無地理參考資訊，使用預設值")
+                geotransform = [-71.16, 0.00002, 0, 46.84, 0, -0.00002]
+
+            print(f"  使用 Geotransform: {geotransform}")
+            dataset.SetGeoTransform(geotransform)
+
+            # 【原生投影】使用數據的原生 CRS（UTM 或 WGS84），
+            # 讓 QGIS OTF 引擎精確處理投影變換到底圖
+            from osgeo import osr
+            srs = osr.SpatialReference()
+            output_epsg = getattr(self.bathymetry_manager, 'output_epsg', 4326)
+            srs.ImportFromEPSG(output_epsg)
+            dataset.SetProjection(srs.ExportToWkt())
+            print(f"  ✓ 已設置投影: EPSG:{output_epsg}")
+
+            # 寫入數據
+            band = dataset.GetRasterBand(1)
+            band.WriteArray(depth_array)
+            band.SetNoDataValue(np.nan)
+            band.FlushCache()
+
+            dataset = None  # 關閉
+
+            # 儲存 GeoTIFF 路徑（用於無閃爍更新）
+            self._bathymetry_tiff_path = temp_path
+
+            # 載入為 QGIS 圖層
+            self.bathymetry_layer = QgsRasterLayer(temp_path, "S-102/S-104 Dynamic Depth", "gdal")
+
+            if not self.bathymetry_layer.isValid():
+                print("[渲染] 錯誤: 無法創建柵格圖層")
+                return
+
+            # 【驗證】確認圖層 CRS 正確
+            from qgis.core import QgsCoordinateReferenceSystem
+            layer_crs = self.bathymetry_layer.crs()
+            expected_authid = f'EPSG:{output_epsg}'
+            if layer_crs.authid() != expected_authid:
+                print(f"  ⚠ 警告: 圖層 CRS 為 {layer_crs.authid()}，強制設置為 {expected_authid}")
+                target_crs = QgsCoordinateReferenceSystem(expected_authid)
+                self.bathymetry_layer.setCrs(target_crs)
+            else:
+                print(f"  ✓ 圖層 CRS 驗證通過: {layer_crs.authid()}")
+
+            # 套用 S-52 配色
+            self._apply_s52_colormap_to_layer(self.bathymetry_layer)
+
+            # 添加到 QGIS
+            QgsProject.instance().addMapLayer(self.bathymetry_layer)
+
+            print("[QGIS 渲染] ✓ 柵格圖層創建完成")
+
+        except Exception as e:
+            print(f"[渲染] 錯誤: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _update_bathymetry_raster_data(self):
+        """無閃爍更新：原地覆寫 GeoTIFF 數據，然後 reload provider"""
+        if self.bathymetry_manager is None or self.bathymetry_manager.adjusted_depth is None:
+            return
+
+        # 如果圖層尚未建立，執行完整建立
+        if (self.bathymetry_layer is None or not self.bathymetry_layer.isValid()
+                or self._bathymetry_tiff_path is None):
+            self._render_bathymetry_to_qgis()
+            return
+
+        try:
+            from osgeo import gdal
+            depth_array = self.bathymetry_manager.adjusted_depth
+
+            # 原地覆寫 GeoTIFF
+            ds = gdal.Open(self._bathymetry_tiff_path, gdal.GA_Update)
+            if ds is None:
+                # Fallback：完整重建
+                self._render_bathymetry_to_qgis()
+                return
+
+            band = ds.GetRasterBand(1)
+            band.WriteArray(depth_array)
+            band.FlushCache()
+            ds = None  # 關閉
+
+            # Reload provider（保留 layer 身份、S-52 色表、圖層樹位置）
+            self.bathymetry_layer.dataProvider().reload()
+            self.bathymetry_layer.triggerRepaint()
+
+        except Exception as e:
+            print(f"[無閃爍更新] 失敗: {e}，回退至完整重建")
+            self._render_bathymetry_to_qgis()
+
+    def _apply_s52_colormap_to_layer(self, raster_layer):
+        """套用 S-52 Day Condition 配色到柵格圖層"""
+        from qgis.core import (
+            QgsSingleBandPseudoColorRenderer, QgsColorRampShader,
+            QgsRasterShader, QgsColorRampLegendNodeSettings
+        )
+        from qgis.PyQt.QtGui import QColor
+
+        # S-52 配色
+        color_ramp_items = [
+            QgsColorRampShader.ColorRampItem(-999, QColor(88, 175, 156), '≤0m (Intertidal)'),
+            QgsColorRampShader.ColorRampItem(0, QColor(88, 175, 156)),
+            QgsColorRampShader.ColorRampItem(5, QColor(97, 184, 255), '0-5m (Very Shallow)'),
+            QgsColorRampShader.ColorRampItem(10, QColor(130, 202, 255), '5-10m (Medium Shallow)'),
+            QgsColorRampShader.ColorRampItem(20, QColor(167, 218, 252), '10-20m (Medium Deep)'),
+            QgsColorRampShader.ColorRampItem(999, QColor(201, 237, 255), '>20m (Deep Water)'),
+        ]
+
+        shader = QgsRasterShader()
+        color_ramp = QgsColorRampShader()
+        color_ramp.setColorRampItemList(color_ramp_items)
+        color_ramp.setColorRampType(QgsColorRampShader.Interpolated)
+        shader.setRasterShaderFunction(color_ramp)
+
+        renderer = QgsSingleBandPseudoColorRenderer(raster_layer.dataProvider(), 1, shader)
+        raster_layer.setRenderer(renderer)
+        raster_layer.triggerRepaint()
+
+        print("[配色] S-52 Day Condition 配色已套用")
+
+    def clear_bathymetry_layer(self):
+        """清除 S-102/S-104 水深圖層（不影響 S-111 流速圖層）"""
+        if self.bathymetry_layer:
+            QgsProject.instance().removeMapLayer(self.bathymetry_layer)
+            self.bathymetry_layer = None
+            print("[清除] S-102/S-104 水深圖層已清除")
+
+        # Clean up temporary GeoTIFF file
+        if self._bathymetry_tiff_path:
+            try:
+                import os
+                if os.path.exists(self._bathymetry_tiff_path):
+                    os.remove(self._bathymetry_tiff_path)
+                    print(f"[清除] 臨時 GeoTIFF 已刪除: {self._bathymetry_tiff_path}")
+            except Exception as e:
+                print(f"[警告] 無法刪除臨時 GeoTIFF: {e}")
+            self._bathymetry_tiff_path = None
+
+        # Clear S-104 interpolation cache and multi-source data
+        if self.bathymetry_manager is not None:
+            self.bathymetry_manager._s104_interpolated_cache.clear()
+            self.bathymetry_manager.s104_current_time = None
+            self.bathymetry_manager.s104_sources.clear()
+            self.bathymetry_manager.s104_time_series.clear()
+            self.bathymetry_manager.s104_sorted_times.clear()
+            self.bathymetry_manager.s104_water_level = None
+            print("[清除] S-104 插值快取與多來源資料已清除")
+
+    def test_s102_loading(self, filepath=None):
+        """
+        測試 S-102 載入功能（可直接在 Python Console 調用）
+
+        用法:
+            from qgis.utils import plugins
+            viewer = plugins['s111_viewer']
+            viewer.test_s102_loading()  # 會彈出檔案選擇對話框
+
+            # 或直接指定路徑:
+            viewer.test_s102_loading(r'C:\path\to\your\s102_file.h5')
+        """
+        print("\n" + "="*60)
+        print("S-102 載入測試")
+        print("="*60)
+
+        # 如果沒有提供路徑，彈出檔案選擇對話框
+        if filepath is None:
+            from qgis.PyQt.QtWidgets import QFileDialog
+            filepath, _ = QFileDialog.getOpenFileName(
+                None,
+                "選擇 S-102 水深檔案進行測試",
+                "",
+                "HDF5 Files (*.h5 *.hdf5);;All Files (*)"
+            )
+
+            if not filepath:
+                print("✗ 未選擇檔案，測試取消")
+                return False
+
+        print(f"\n測試檔案: {filepath}")
+
+        try:
+            # 創建渲染器
+            print("\n[1/4] 創建 S-102 渲染器...")
+            if self.bathymetry_manager is None:
+                self.bathymetry_manager = S102S104Renderer()
+            print("✓ 渲染器創建完成")
+
+            # 讀取 S-102 數據
+            print("\n[2/4] 讀取 S-102 數據...")
+            depth_data = self.bathymetry_manager.read_s102_depth(filepath)
+
+            if depth_data is None:
+                print("\n✗✗✗ 讀取失敗！")
+                QMessageBox.critical(
+                    None,
+                    "測試失敗",
+                    "無法讀取 S-102 數據，請檢查檔案格式。"
+                )
+                return False
+
+            # 顯示統計資訊
+            print("\n[3/4] 數據統計...")
+            print(f"  ✓ 形狀: {depth_data.shape}")
+            print(f"  ✓ 深度範圍: {np.nanmin(depth_data):.2f} ~ {np.nanmax(depth_data):.2f} 米")
+            print(f"  ✓ 有效點數: {np.sum(~np.isnan(depth_data))}/{depth_data.size} ({100*np.sum(~np.isnan(depth_data))/depth_data.size:.1f}%)")
+            print(f"  ✓ 平均深度: {np.nanmean(depth_data):.2f} 米")
+            print(f"  ✓ Geotransform: {self.bathymetry_manager.geotransform}")
+
+            # 渲染到 QGIS
+            print("\n[4/4] 渲染到 QGIS...")
+            self.s102_filepath = filepath
+            self.bathymetry_manager.adjusted_depth = depth_data
+            self._render_bathymetry_to_qgis()
+
+            # 成功訊息
+            print("\n" + "="*60)
+            print("✓✓✓ 測試成功！")
+            print("="*60)
+            print("\n請查看 QGIS 圖層面板:")
+            print("  → 圖層名稱: 'S-102/S-104 Dynamic Depth'")
+            print("  → 配色: S-52 Day Condition (5 個深度區間)")
+            print("  → 無效區域: 透明顯示")
+            print("\n注意: S-111 流速圖層不受影響 ✓")
+
+            QMessageBox.information(
+                None,
+                "測試成功",
+                f"S-102 載入成功！\n\n"
+                f"深度範圍: {np.nanmin(depth_data):.2f} ~ {np.nanmax(depth_data):.2f} 米\n"
+                f"數據形狀: {depth_data.shape}\n\n"
+                f"圖層已添加到 QGIS，請查看圖層面板。"
+            )
+
+            return True
+
+        except Exception as e:
+            print(f"\n✗✗✗ 測試失敗: {e}")
+            import traceback
+            traceback.print_exc()
+
+            QMessageBox.critical(
+                None,
+                "測試失敗",
+                f"發生錯誤:\n{str(e)}\n\n請查看 Python Console 獲取詳細資訊。"
+            )
+            return False
+
+
+# ==========================================
+# S-102 / S-104 Dynamic Depth Renderer
+# ==========================================
+
+class S102S104Renderer:
+    """
+    S-102 (Bathymetry) + S-104 (Water Level) 動態水深渲染器
+    嚴格遵守 IHO S-52 Day Condition 配色標準
+    """
+    
+    # S-52 Day Condition 配色 (RGB normalized to 0-1)
+    S52_DAY_COLORS = {
+        'DEPIT': (88/255, 175/255, 156/255),   # Intertidal (≤0m) - 潮間帶/陸地
+        'DEPVS': (97/255, 184/255, 255/255),   # Very Shallow (0-5m) - 極淺/危險
+        'DEPMS': (130/255, 202/255, 255/255),  # Medium Shallow (5-10m) - 中淺
+        'DEPMD': (167/255, 218/255, 252/255),  # Medium Deep (10-20m) - 中深
+        'DEPDW': (201/255, 237/255, 255/255),  # Deep Water (>20m) - 深水
+    }
+    
+    # 深度邊界 (meters)
+    DEPTH_BOUNDARIES = [-float('inf'), 0, 5, 10, 20, float('inf')]
+    
+    def __init__(self):
+        """初始化渲染器"""
+        self.s102_depth = None
+        self.s104_water_level = None
+        self.adjusted_depth = None
+        self.colormap = None
+        self.norm = None
+        self.s102_geotransform = None  # S-102 地理參考資訊
+        self.s104_geotransform = None  # S-104 地理參考資訊
+        self.geotransform = None  # 最終使用的地理參考（通常為 S-102）
+        self.s102_crs = None  # S-102 座標參考系統
+        self.s104_crs = None  # S-104 座標參考系統
+        self.output_epsg = 4326  # 輸出圖層的 EPSG（原生投影，讓 QGIS OTF 處理顯示）
+        # S-104 時間序列支援
+        self.s104_time_series = {}           # {datetime: numpy.ndarray} 合併後的時間步
+        self.s104_sorted_times = []          # 排序後的 datetime 列表
+        self.s104_current_time = None        # 目前使用的時間步
+        self._interpolator_cache = None      # 快取 S-102 查詢網格點（避免重複建立 meshgrid）
+        self._s104_interpolated_cache = {}   # {datetime: interpolated_array} 插值結果快取
+        # === 多 S-104 檔案支援 (Spatio-Temporal Fusion) ===
+        # 每個來源檔案的獨立資料，結構:
+        # { filepath: { 'issue_date': datetime, 'geotransform': [...],
+        #               'time_series': {datetime: ndarray}, 'sorted_times': [...] } }
+        self.s104_sources = {}
+        self._create_s52_colormap()
+    
+    def _create_s52_colormap(self):
+        """創建 S-52 Day Condition 離散配色映射"""
+        from matplotlib.colors import ListedColormap, BoundaryNorm
+        
+        # 按深度順序排列顏色
+        colors = [
+            self.S52_DAY_COLORS['DEPIT'],  # ≤0m
+            self.S52_DAY_COLORS['DEPVS'],  # 0-5m
+            self.S52_DAY_COLORS['DEPMS'],  # 5-10m
+            self.S52_DAY_COLORS['DEPMD'],  # 10-20m
+            self.S52_DAY_COLORS['DEPDW'],  # >20m
+        ]
+        
+        self.colormap = ListedColormap(colors)
+        self.colormap.set_bad(alpha=0)  # NaN 值設為透明
+        
+        self.norm = BoundaryNorm(
+            self.DEPTH_BOUNDARIES, 
+            ncolors=len(colors), 
+            clip=False
+        )
+        
+        print("[S-52 Colormap] 創建完成")
+        print(f"  邊界: {self.DEPTH_BOUNDARIES}")
+        print(f"  顏色數: {len(colors)}")
+    
+    def read_s102_depth(self, filepath):
+        """
+        讀取 S-102 靜態水深數據
+        
+        Args:
+            filepath: S-102 HDF5 檔案路徑
+            
+        Returns:
+            numpy.ndarray: 水深數據 (meters, negative = below sea level)
+        """
+        try:
+            import h5py
+            
+            with h5py.File(filepath, 'r') as f:
+                print(f"\n[S-102 讀取] 開始讀取: {filepath}")
+                print(f"  HDF5 頂層結構: {list(f.keys())}")
+                
+                # 尋找 BathymetryCoverage 組
+                depth_data = None
+                target_paths = [
+                    '/BathymetryCoverage/BathymetryCoverage.01/Group_001/values',
+                    '/BathymetryCoverage/Group_001/values',
+                    '/BathymetryCoverage/values',
+                    '/BathymetryCoverage/BathymetryCoverage.01/Group_001/depth',
+                    '/BathymetryCoverage/Group_001/depth',
+                ]
+                
+                for path in target_paths:
+                    if self._path_exists(f, path):
+                        dataset = f[path]
+                        print(f"  找到數據: {path}")
+                        print(f"  形狀: {dataset.shape}, 類型: {dataset.dtype}")
+                        
+                        # 讀取數據
+                        raw_data = dataset[()]
+                        
+                        # 如果是結構化數組，提取 depth 欄位
+                        if hasattr(raw_data, 'dtype') and raw_data.dtype.names:
+                            print(f"  結構化數組欄位: {raw_data.dtype.names}")
+                            if 'depth' in raw_data.dtype.names:
+                                depth_data = raw_data['depth']
+                            else:
+                                depth_data = raw_data
+                        else:
+                            depth_data = raw_data
+                        
+                        # 【IHO 填充值清洗】多重過濾，防止異常值參與運算
+                        depth_data = depth_data.astype(np.float64)
+
+                        # 1. 處理 HDF5 聲明的 _FillValue
+                        fill_value = dataset.attrs.get('_FillValue', 1000000.0)
+                        if isinstance(fill_value, np.ndarray):
+                            fill_value = fill_value[0]
+                        print(f"  FillValue (HDF5): {fill_value}")
+                        depth_data = np.where(depth_data == fill_value, np.nan, depth_data)
+
+                        # 2. 常見的 S-102 填充值模式
+                        common_fills = [-9999.0, -9999.9, 9999.0, 1000000.0, -1e10, 1e10]
+                        for fv in common_fills:
+                            matched = np.sum(depth_data == fv)
+                            if matched > 0:
+                                print(f"  → 清除常見填充值 {fv}: {matched} 點")
+                                depth_data = np.where(depth_data == fv, np.nan, depth_data)
+
+                        valid_count = np.sum(~np.isnan(depth_data))
+                        total_count = depth_data.size
+                        print(f"  有效數據點: {valid_count}/{total_count} ({100*valid_count/total_count:.1f}%)")
+                        if valid_count > 0:
+                            print(f"  深度範圍: [{np.nanmin(depth_data):.2f}, {np.nanmax(depth_data):.2f}] m")
+                        else:
+                            print(f"  ⚠ 警告: 所有數據點均為無效值！")
+
+                        # 讀取地理參考資訊
+                        self._extract_s102_geotransform(f, path)
+
+                        # S-102 數據上下翻轉（與 S-111 Type 2 相同問題）
+                        depth_data = np.flipud(depth_data)
+                        print(f"  ✓ 已執行上下翻轉 (flipud)")
+
+                        self.s102_depth = depth_data
+                        return depth_data
+                
+                print("  ⚠ 警告: 未找到有效的 depth 數據集")
+                return None
+                
+        except Exception as e:
+            print(f"[S-102 讀取] 錯誤: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def _clean_s104_fill_values(self, data, dataset):
+        """清洗 S-104 填充值與異常值，返回 float64 陣列（NaN 代替無效值）"""
+        data = data.astype(np.float64)
+
+        # 1. HDF5 聲明的 _FillValue
+        fill_value = dataset.attrs.get('_FillValue', 1000000.0)
+        if isinstance(fill_value, np.ndarray):
+            fill_value = fill_value[0]
+        data = np.where(data == fill_value, np.nan, data)
+
+        # 2. 常見 S-104 填充值模式
+        for fv in [-9999.0, -9999.9, 9999.0, 1000000.0, -1e10, 1e10]:
+            matched = np.sum(data == fv)
+            if matched > 0:
+                data = np.where(data == fv, np.nan, data)
+
+        # 3. 物理合理性：水位偏差不應超過 ±100m
+        extreme = np.abs(data) > 100.0
+        if np.nansum(extreme) > 0:
+            data = np.where(extreme, np.nan, data)
+
+        return data
+
+    def _extract_group_datetime(self, group, group_name):
+        """從 HDF5 Group 解析 timePoint 屬性為 datetime"""
+        import datetime as _dt
+        for time_field in ['timePoint', 'timepoint', 'time', 'Time',
+                           'dateTimeOfRecord', 'DateTime']:
+            if time_field in group.attrs:
+                time_value = group.attrs[time_field]
+                if isinstance(time_value, bytes):
+                    time_value = time_value.decode('utf-8', errors='replace')
+                if isinstance(time_value, str):
+                    clean = time_value.rstrip('Z').strip()
+                    try:
+                        return _dt.datetime.fromisoformat(clean)
+                    except ValueError:
+                        # 嘗試其他格式
+                        for fmt in ['%Y%m%dT%H%M%SZ', '%Y-%m-%dT%H:%M:%S',
+                                    '%Y%m%dT%H%M%S', '%Y-%m-%d %H:%M:%S']:
+                            try:
+                                return _dt.datetime.strptime(clean, fmt)
+                            except ValueError:
+                                continue
+        # Fallback：用 Group 編號生成序號（無真實時間）
+        import datetime as _dt
+        idx = int(group_name.split('_')[1]) if '_' in group_name else 0
+        return _dt.datetime(2000, 1, 1) + _dt.timedelta(hours=idx)
+
+    def _find_nearest_s104_time(self, target_time):
+        """二分搜尋最接近 target_time 的 S-104 時間步"""
+        import bisect
+        if not self.s104_sorted_times:
+            return None
+        idx = bisect.bisect_left(self.s104_sorted_times, target_time)
+        candidates = []
+        if idx > 0:
+            candidates.append(self.s104_sorted_times[idx - 1])
+        if idx < len(self.s104_sorted_times):
+            candidates.append(self.s104_sorted_times[idx])
+        return min(candidates, key=lambda t: abs((t - target_time).total_seconds()))
+
+    def _interpolate_s104_onto_s102(self):
+        """將當前 self.s104_water_level 插值到 S-102 網格上，返回 2D 陣列"""
+        from scipy.interpolate import RegularGridInterpolator
+
+        s104_rows, s104_cols = self.s104_water_level.shape
+        s104_gt = self.s104_geotransform
+        s104_x = s104_gt[0] + np.arange(s104_cols) * s104_gt[1]
+        s104_y = s104_gt[3] + np.arange(s104_rows) * s104_gt[5]
+
+        # 快取 S-102 查詢網格（S-102 不變，只需建立一次）
+        s102_rows, s102_cols = self.s102_depth.shape
+        if self._interpolator_cache is None:
+            s102_gt = self.s102_geotransform
+            s102_x = s102_gt[0] + np.arange(s102_cols) * s102_gt[1]
+            s102_y = s102_gt[3] + np.arange(s102_rows) * s102_gt[5]
+            s102_yy, s102_xx = np.meshgrid(s102_y, s102_x, indexing='ij')
+            self._interpolator_cache = np.column_stack([s102_yy.ravel(), s102_xx.ravel()])
+
+        interpolator = RegularGridInterpolator(
+            (s104_y, s104_x),
+            self.s104_water_level,
+            method='linear',
+            bounds_error=False,
+            fill_value=np.nan
+        )
+
+        return interpolator(self._interpolator_cache).reshape(s102_rows, s102_cols)
+
+    def _parse_s104_issue_date(self, hdf5_file, filepath):
+        """從 S-104 HDF5 Root Attributes 解析 Issue Date (發布日期)"""
+        import datetime as _dt
+
+        # 嘗試多種 HDF5 屬性名稱
+        for attr_name in ['issueDate', 'issueTime', 'sourceDate',
+                          'dateOfIssue', 'dateTimeOfIssue']:
+            if attr_name in hdf5_file.attrs:
+                val = hdf5_file.attrs[attr_name]
+                if isinstance(val, bytes):
+                    val = val.decode('utf-8', errors='replace')
+                if isinstance(val, str):
+                    clean = val.rstrip('Z').strip()
+                    for fmt in ['%Y-%m-%dT%H:%M:%S', '%Y%m%dT%H%M%SZ',
+                                '%Y%m%dT%H%M%S', '%Y-%m-%d %H:%M:%S',
+                                '%Y-%m-%d', '%Y%m%d']:
+                        try:
+                            return _dt.datetime.strptime(clean, fmt)
+                        except ValueError:
+                            continue
+
+        # 合併 issueDate + issueTime (兩個分開的屬性)
+        date_val = hdf5_file.attrs.get('issueDate', None)
+        time_val = hdf5_file.attrs.get('issueTime', None)
+        if date_val is not None:
+            if isinstance(date_val, bytes):
+                date_val = date_val.decode('utf-8', errors='replace')
+            if isinstance(time_val, bytes):
+                time_val = time_val.decode('utf-8', errors='replace') if time_val else '00:00:00'
+            combined = f"{date_val}T{time_val or '00:00:00'}".rstrip('Z').strip()
+            for fmt in ['%Y-%m-%dT%H:%M:%S', '%Y%m%dT%H%M%S']:
+                try:
+                    return _dt.datetime.strptime(combined, fmt)
+                except ValueError:
+                    continue
+
+        # Fallback: 使用檔案修改時間
+        import os
+        mtime = os.path.getmtime(filepath)
+        fallback = _dt.datetime.fromtimestamp(mtime)
+        print(f"  ⚠ 無法從 HDF5 取得 Issue Date，使用檔案修改時間: {fallback}")
+        return fallback
+
+    def read_s104_water_level(self, filepath):
+        """
+        讀取 S-104 動態水位數據（支援多時間步 Group_XXX）
+        支援多檔案累加：每次呼叫會將該檔案的資料加入 s104_sources，
+        然後自動執行 Painter's Algorithm 合併。
+
+        Args:
+            filepath: S-104 HDF5 檔案路徑
+
+        Returns:
+            numpy.ndarray: 水位高度數據 (meters, positive = above reference)
+        """
+        try:
+            import h5py
+
+            with h5py.File(filepath, 'r') as f:
+                print(f"\n[S-104 讀取] 開始讀取: {filepath}")
+                print(f"  HDF5 頂層結構: {list(f.keys())}")
+
+                # === 解析 Issue Date (發布日期) ===
+                issue_date = self._parse_s104_issue_date(f, filepath)
+                print(f"  Issue Date: {issue_date}")
+
+                # 尋找 WaterLevel coverage 路徑
+                coverage_path = None
+                for cp in ['/WaterLevel/WaterLevel.01',
+                           '/WaterLevelInformation',
+                           '/WaterLevel']:
+                    if self._path_exists(f, cp):
+                        coverage_path = cp
+                        break
+
+                if coverage_path is None:
+                    print("  ⚠ 警告: 未找到 WaterLevel coverage group")
+                    return None
+
+                coverage_group = f[coverage_path]
+                print(f"  Coverage 路徑: {coverage_path}")
+                print(f"  Coverage 子項: {list(coverage_group.keys())}")
+
+                # 列舉所有 Group_XXX（時間步）
+                group_names = sorted(
+                    [k for k in coverage_group.keys() if k.startswith('Group_')],
+                    key=lambda x: int(x.split('_')[1]) if '_' in x else 0
+                )
+
+                if not group_names:
+                    print("  ⚠ 警告: 未找到任何 Group_XXX")
+                    return None
+
+                print(f"  找到 {len(group_names)} 個時間步: {group_names[:5]}{'...' if len(group_names) > 5 else ''}")
+
+                # 地理參考只提取一次（所有 Group 共用同一網格）
+                first_values_path = f'{coverage_path}/{group_names[0]}/values'
+                if not self._path_exists(f, first_values_path):
+                    first_values_path = f'{coverage_path}/{group_names[0]}/waterLevelHeight'
+                if self._path_exists(f, first_values_path):
+                    self._extract_s104_geotransform(f, first_values_path)
+                else:
+                    print(f"  ⚠ 無法找到 values 數據集: {first_values_path}")
+                    return None
+
+                # 讀取此檔案的地理參考（獨立保存）
+                file_geotransform = list(self.s104_geotransform) if self.s104_geotransform else None
+
+                # 此檔案的時間序列
+                file_time_series = {}
+
+                # 遍歷每個 Group 讀取水位數據
+                for group_name in group_names:
+                    group = coverage_group[group_name]
+
+                    # 解析時間
+                    dt = self._extract_group_datetime(group, group_name)
+
+                    # 尋找 values 數據集
+                    values_dataset = None
+                    for vname in ['values', 'waterLevelHeight']:
+                        vpath = f'{coverage_path}/{group_name}/{vname}'
+                        if self._path_exists(f, vpath):
+                            values_dataset = f[vpath]
+                            break
+
+                    if values_dataset is None:
+                        print(f"    {group_name}: 無 values 數據集，跳過")
+                        continue
+
+                    # 讀取數據
+                    raw_data = values_dataset[()]
+                    if hasattr(raw_data, 'dtype') and raw_data.dtype.names:
+                        if 'waterLevelHeight' in raw_data.dtype.names:
+                            water_level_data = raw_data['waterLevelHeight']
+                        else:
+                            water_level_data = raw_data
+                    else:
+                        water_level_data = raw_data
+
+                    # 填充值清洗
+                    water_level_data = self._clean_s104_fill_values(water_level_data, values_dataset)
+
+                    # 上下翻轉
+                    water_level_data = np.flipud(water_level_data)
+
+                    file_time_series[dt] = water_level_data
+
+                if not file_time_series:
+                    print("  ⚠ 警告: 未成功讀取任何水位時間步")
+                    return None
+
+                # === 將此檔案的資料存入 s104_sources ===
+                import os
+                # 記錄此檔案的 CRS EPSG (從剛剛 _extract_s104_geotransform 設定的 s104_crs 取得)
+                file_crs_epsg = self.s104_crs.get('epsg', 4326) if self.s104_crs else 4326
+                self.s104_sources[filepath] = {
+                    'issue_date': issue_date,
+                    'filename': os.path.basename(filepath),
+                    'geotransform': file_geotransform,
+                    'crs_epsg': file_crs_epsg,
+                    'time_series': file_time_series,
+                    'sorted_times': sorted(file_time_series.keys()),
+                }
+
+                file_sorted_times = self.s104_sources[filepath]['sorted_times']
+                print(f"\n  [S-104 時間序列] 載入完成:")
+                print(f"    Issue Date: {issue_date}")
+                print(f"    時間步數量: {len(file_sorted_times)}")
+                print(f"    時間範圍: {file_sorted_times[0]} → {file_sorted_times[-1]}")
+
+                sample = file_time_series[file_sorted_times[0]]
+                valid_count = np.sum(~np.isnan(sample))
+                total_count = sample.size
+                print(f"    首個時間步形狀: {sample.shape}")
+                print(f"    首個時間步有效點: {valid_count}/{total_count} ({100*valid_count/total_count:.1f}%)")
+                if valid_count > 0:
+                    print(f"    首個時間步水位範圍: [{np.nanmin(sample):.2f}, {np.nanmax(sample):.2f}] m")
+
+                # === 執行多檔案合併 (Painter's Algorithm) ===
+                self._merge_s104_sources()
+
+                return self.s104_water_level
+
+        except Exception as e:
+            print(f"[S-104 讀取] 錯誤: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def _merge_s104_sources(self):
+        """
+        多 S-104 檔案合併 (Painter's Algorithm / Last-Writer-Wins)
+        使用 WGS84 經緯度點名法：所有座標先轉為 WGS84，
+        嚴格檢查是否落在 S-104 的經緯度框框內，才准取值。
+
+        依 Issue Date 升序排序所有 S-104 來源，
+        對每個時間步，以 S-102 網格為底圖，依序疊加。
+        結果寫入 self.s104_time_series / self.s104_sorted_times。
+        """
+        if not self.s104_sources:
+            return
+
+        # 1. 依 Issue Date 升序排序 (最舊 → 最新)
+        sorted_sources = sorted(
+            self.s104_sources.values(),
+            key=lambda src: src['issue_date']
+        )
+
+        print(f"\n[S-104 合併] Painter's Algorithm (WGS84 Lookup): {len(sorted_sources)} 個來源檔案")
+        for i, src in enumerate(sorted_sources):
+            print(f"  [{i+1}] {src['filename']} (Issue: {src['issue_date']})")
+
+        # 2. 決定底圖
+        if self.s102_depth is not None:
+            base_shape = self.s102_depth.shape
+            base_gt = self.s102_geotransform
+            base_epsg = self.output_epsg
+            print(f"  底圖: S-102 網格 {base_shape}, EPSG:{base_epsg}")
+        else:
+            first_src = sorted_sources[0]
+            first_time = first_src['sorted_times'][0]
+            base_shape = first_src['time_series'][first_time].shape
+            base_gt = first_src['geotransform']
+            base_epsg = first_src.get('crs_epsg', 4326)
+            print(f"  底圖: 首個 S-104 來源 {base_shape}, EPSG:{base_epsg}")
+
+        base_rows, base_cols = base_shape
+
+        # 3. 生成 S-102 每個像素中心的 WGS84 經緯度
+        base_lon_2d, base_lat_2d = self._base_grid_to_wgs84(
+            base_gt, base_shape, base_epsg
+        )
+        print(f"  底圖 WGS84 範圍: Lon=[{np.nanmin(base_lon_2d):.6f}, {np.nanmax(base_lon_2d):.6f}], "
+              f"Lat=[{np.nanmin(base_lat_2d):.6f}, {np.nanmax(base_lat_2d):.6f}]")
+
+        # 4. 預計算每個 S-104 來源的座標映射
+        source_index_maps = {}
+        for src in sorted_sources:
+            src_gt = src['geotransform']
+            if src_gt is None:
+                print(f"  ⚠ {src['filename']}: 無 GeoTransform，跳過")
+                continue
+
+            src_epsg = src.get('crs_epsg', 4326)
+            sample_time = src['sorted_times'][0]
+            src_shape = src['time_series'][sample_time].shape
+
+            row_idx, col_idx, valid = self._compute_coordinate_mapping(
+                base_lon_2d, base_lat_2d, base_shape,
+                src_gt, src_shape, src_epsg
+            )
+            source_index_maps[src['filename']] = (row_idx, col_idx, valid)
+            n_valid = np.sum(valid)
+            n_total = base_shape[0] * base_shape[1]
+            pct = 100 * n_valid / n_total if n_total > 0 else 0
+            print(f"  座標映射 {src['filename']}: {n_valid}/{n_total} 像素在 S-104 範圍內 ({pct:.1f}%)")
+
+        # 5. 收集所有時間步的聯集
+        all_times = set()
+        for src in sorted_sources:
+            all_times.update(src['time_series'].keys())
+
+        # 清除舊的合併結果和快取
+        self.s104_time_series = {}
+        self._s104_interpolated_cache = {}
+
+        # 6. 對每個時間步執行 Painter's Algorithm
+        for t in sorted(all_times):
+            merged = np.full(base_shape, np.nan, dtype=np.float64)
+
+            for src in sorted_sources:
+                src_data = src['time_series'].get(t)
+                if src_data is None:
+                    continue
+
+                mapping = source_index_maps.get(src['filename'])
+                if mapping is None:
+                    continue
+
+                row_idx, col_idx, valid = mapping
+
+                # 從 S-104 陣列中取值 (只取 valid mask 內的像素)
+                resampled = np.full(base_shape, np.nan, dtype=np.float64)
+                resampled_flat = resampled.ravel()
+                valid_flat = valid.ravel()
+
+                src_rows = row_idx.ravel()[valid_flat]
+                src_cols = col_idx.ravel()[valid_flat]
+                resampled_flat[valid_flat] = src_data[src_rows, src_cols]
+                resampled = resampled_flat.reshape(base_shape)
+
+                # Painter's Algorithm: 新數據覆蓋舊數據
+                paint_mask = ~np.isnan(resampled)
+                merged[paint_mask] = resampled[paint_mask]
+
+                n_painted = np.sum(paint_mask)
+                if n_painted > 0:
+                    print(f"  [合併] t={t}: {src['filename']} 覆蓋 {n_painted} 像素")
+
+            if np.any(~np.isnan(merged)):
+                self.s104_time_series[t] = merged
+
+        # 7. 重建排序時間列表
+        self.s104_sorted_times = sorted(self.s104_time_series.keys())
+
+        if self.s104_sorted_times:
+            first_time = self.s104_sorted_times[0]
+            self.s104_water_level = self.s104_time_series[first_time]
+            self.s104_current_time = first_time
+
+            print(f"\n[S-104 合併] 完成:")
+            print(f"  合併後時間步: {len(self.s104_sorted_times)}")
+            print(f"  時間範圍: {self.s104_sorted_times[0]} → {self.s104_sorted_times[-1]}")
+        else:
+            print("[S-104 合併] ⚠ 合併後無有效時間步")
+
+    def _base_grid_to_wgs84(self, base_gt, base_shape, base_epsg):
+        """
+        將底圖 (S-102) 的每個像素中心座標轉換為 WGS84 經緯度。
+
+        Args:
+            base_gt: GeoTransform [origin_x, pixel_w, 0, origin_y, 0, -pixel_h]
+            base_shape: (rows, cols)
+            base_epsg: EPSG 代碼
+
+        Returns:
+            (lon_2d, lat_2d) — 都是 base_shape 的 2D 陣列 (WGS84 度)
+        """
+        base_rows, base_cols = base_shape
+        col_arr = np.arange(base_cols, dtype=np.float64)
+        row_arr = np.arange(base_rows, dtype=np.float64)
+
+        # 像素中心的原生座標
+        x_1d = base_gt[0] + (col_arr + 0.5) * base_gt[1]
+        y_1d = base_gt[3] + (row_arr + 0.5) * base_gt[5]
+
+        if base_epsg == 4326:
+            # 已經是 WGS84，x = lon, y = lat
+            lon_2d, lat_2d = np.meshgrid(x_1d, y_1d)  # shape: (rows, cols)
+            return lon_2d, lat_2d
+
+        # 非 WGS84 → 需要投影轉換
+        y_2d, x_2d = np.meshgrid(y_1d, x_1d, indexing='ij')
+
+        try:
+            from pyproj import Transformer
+            transformer = Transformer.from_crs(
+                f"EPSG:{base_epsg}", "EPSG:4326", always_xy=True
+            )
+            print(f"  底圖 CRS 轉換: EPSG:{base_epsg} → EPSG:4326 (WGS84)")
+
+            lon_flat, lat_flat = transformer.transform(x_2d.ravel(), y_2d.ravel())
+            lon_2d = lon_flat.reshape(base_shape)
+            lat_2d = lat_flat.reshape(base_shape)
+
+        except ImportError:
+            # Fallback: QgsCoordinateTransform
+            print(f"  ⚠ pyproj 未安裝，使用 QgsCoordinateTransform (較慢)")
+            from qgis.core import QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsProject
+            base_crs = QgsCoordinateReferenceSystem(f"EPSG:{base_epsg}")
+            wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
+            xform = QgsCoordinateTransform(base_crs, wgs84, QgsProject.instance())
+
+            lon_2d = np.empty(base_shape, dtype=np.float64)
+            lat_2d = np.empty(base_shape, dtype=np.float64)
+            for r in range(base_rows):
+                for c in range(base_cols):
+                    try:
+                        pt = xform.transform(QgsPointXY(x_2d[r, c], y_2d[r, c]))
+                        lon_2d[r, c] = pt.x()
+                        lat_2d[r, c] = pt.y()
+                    except Exception:
+                        lon_2d[r, c] = np.nan
+                        lat_2d[r, c] = np.nan
+
+        return lon_2d, lat_2d
+
+    def _compute_coordinate_mapping(self, base_lon_2d, base_lat_2d, base_shape,
+                                      src_gt, src_shape, src_epsg):
+        """
+        WGS84 經緯度點名法：嚴格檢查底圖每個像素是否落在 S-104 的範圍內。
+
+        邏輯:
+          1. 計算 S-104 的 WGS84 Bounding Box (min_lon, max_lon, min_lat, max_lat)
+          2. 對底圖每個像素的 (lon, lat)，判斷是否在框框內
+          3. 在框框內的 → 計算 S-104 陣列索引
+          4. 在框框外的 → 強制 NaN，絕不碰
+
+        Args:
+            base_lon_2d: 底圖每個像素的經度 (WGS84), shape=base_shape
+            base_lat_2d: 底圖每個像素的緯度 (WGS84), shape=base_shape
+            base_shape: (rows, cols)
+            src_gt: S-104 GeoTransform (可能是 UTM 或 WGS84)
+            src_shape: S-104 (rows, cols)
+            src_epsg: S-104 EPSG 代碼
+
+        Returns:
+            (row_indices, col_indices, valid_mask) — 都是 base_shape 的 2D 陣列
+        """
+        src_rows, src_cols = src_shape
+
+        # === Step 1: 計算 S-104 的 WGS84 四個角點 ===
+        # S-104 四角的原生座標
+        corners_x = [
+            src_gt[0],                           # 左上 x
+            src_gt[0] + src_cols * src_gt[1],    # 右上 x
+            src_gt[0],                           # 左下 x
+            src_gt[0] + src_cols * src_gt[1],    # 右下 x
+        ]
+        corners_y = [
+            src_gt[3],                           # 左上 y
+            src_gt[3],                           # 右上 y
+            src_gt[3] + src_rows * src_gt[5],    # 左下 y
+            src_gt[3] + src_rows * src_gt[5],    # 右下 y
+        ]
+
+        if src_epsg == 4326:
+            # 已經是 WGS84
+            corners_lon = np.array(corners_x)
+            corners_lat = np.array(corners_y)
+            # S-104 的 lon/lat 步長
+            s104_lon_step = src_gt[1]    # 正值
+            s104_lat_step = src_gt[5]    # 負值 (top→bottom)
+            # S-104 的 origin (左上角)
+            s104_origin_lon = src_gt[0]
+            s104_origin_lat = src_gt[3]
+        else:
+            # 非 WGS84 → 轉換四角到 WGS84
+            try:
+                from pyproj import Transformer
+                tf = Transformer.from_crs(f"EPSG:{src_epsg}", "EPSG:4326", always_xy=True)
+                corners_lon, corners_lat = tf.transform(corners_x, corners_y)
+                corners_lon = np.array(corners_lon)
+                corners_lat = np.array(corners_lat)
+
+                # 計算 WGS84 等效的 lon/lat 步長 (近似：用左邊界上下兩角估算)
+                s104_lon_step = (corners_lon[1] - corners_lon[0]) / src_cols
+                s104_lat_step = (corners_lat[2] - corners_lat[0]) / src_rows  # 負值
+                s104_origin_lon = corners_lon[0]
+                s104_origin_lat = corners_lat[0]
+
+                print(f"    S-104 CRS 轉換 EPSG:{src_epsg} → WGS84")
+            except ImportError:
+                from qgis.core import QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsProject
+                src_crs_obj = QgsCoordinateReferenceSystem(f"EPSG:{src_epsg}")
+                wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
+                xform = QgsCoordinateTransform(src_crs_obj, wgs84, QgsProject.instance())
+
+                corners_lon = np.empty(4)
+                corners_lat = np.empty(4)
+                for i in range(4):
+                    pt = xform.transform(QgsPointXY(corners_x[i], corners_y[i]))
+                    corners_lon[i] = pt.x()
+                    corners_lat[i] = pt.y()
+
+                s104_lon_step = (corners_lon[1] - corners_lon[0]) / src_cols
+                s104_lat_step = (corners_lat[2] - corners_lat[0]) / src_rows
+                s104_origin_lon = corners_lon[0]
+                s104_origin_lat = corners_lat[0]
+
+        # === Step 2: S-104 WGS84 Bounding Box ===
+        s104_min_lon = float(np.min(corners_lon))
+        s104_max_lon = float(np.max(corners_lon))
+        s104_min_lat = float(np.min(corners_lat))
+        s104_max_lat = float(np.max(corners_lat))
+
+        print(f"    S-104 WGS84 BBox: Lon=[{s104_min_lon:.6f}, {s104_max_lon:.6f}], "
+              f"Lat=[{s104_min_lat:.6f}, {s104_max_lat:.6f}]")
+
+        # === Step 3: 嚴格邊界檢查 — 只有在框框內才算 valid ===
+        inside_mask = (
+            (base_lon_2d >= s104_min_lon) & (base_lon_2d <= s104_max_lon) &
+            (base_lat_2d >= s104_min_lat) & (base_lat_2d <= s104_max_lat)
+        )
+
+        n_inside = np.sum(inside_mask)
+        print(f"    嚴格邊界檢查: {n_inside}/{base_shape[0]*base_shape[1]} 個底圖像素在 S-104 框框內")
+
+        if n_inside == 0:
+            # 完全沒有重疊
+            dummy = np.zeros(base_shape, dtype=np.int64)
+            return dummy, dummy, np.zeros(base_shape, dtype=bool)
+
+        # === Step 4: 計算 S-104 陣列索引 (只對 inside_mask=True 的像素) ===
+        # src_col = (lon - origin_lon) / lon_step
+        # src_row = (lat - origin_lat) / lat_step   (lat_step 是負的，所以 row 0 = max_lat)
+        src_col_f = (base_lon_2d - s104_origin_lon) / s104_lon_step
+        src_row_f = (base_lat_2d - s104_origin_lat) / s104_lat_step
+
+        src_col_int = np.floor(src_col_f).astype(np.int64)
+        src_row_int = np.floor(src_row_f).astype(np.int64)
+
+        # === Step 5: 二次邊界檢查 (防止浮點誤差導致索引越界) ===
+        valid = (
+            inside_mask &
+            (src_row_int >= 0) & (src_row_int < src_rows) &
+            (src_col_int >= 0) & (src_col_int < src_cols)
+        )
+
+        # 越界索引設為 0 (不會被使用)
+        src_row_int = np.where(valid, src_row_int, 0)
+        src_col_int = np.where(valid, src_col_int, 0)
+
+        return src_row_int, src_col_int, valid
+    
+    def calculate_dynamic_depth(self, target_time=None):
+        """
+        計算動態調整後的水深（符合 IHO 規範）
+
+        Args:
+            target_time: datetime 物件，指定要使用的 S-104 時間步。
+                         None 時使用當前 self.s104_water_level（向下相容）。
+
+        Formula: Adjusted_Depth = S102_Depth + S104_WaterLevel
+
+        Returns:
+            numpy.ndarray: 調整後的水深 (meters)
+        """
+        if self.s102_depth is None:
+            print("[動態水深計算] 錯誤: 缺少 S-102 數據")
+            return None
+
+        if self.s104_water_level is None and not self.s104_time_series:
+            print("[動態水深計算] 無 S-104 數據，使用靜態 S-102 深度")
+            self.adjusted_depth = self.s102_depth.copy()
+            return self.adjusted_depth
+
+        if self.s102_geotransform is None or self.s104_geotransform is None:
+            print("[動態水深計算] 錯誤: 缺少地理參考資訊")
+            return None
+
+        try:
+            # 決定要使用的 S-104 時間步
+            nearest_time = None
+            if target_time is not None and self.s104_time_series:
+                nearest_time = self._find_nearest_s104_time(target_time)
+                if nearest_time is not None:
+                    self.s104_water_level = self.s104_time_series[nearest_time]
+                    self.s104_current_time = nearest_time
+                    time_diff = abs((target_time - nearest_time).total_seconds())
+                    print(f"[動態水深] 目標時間: {target_time} → 最近 S-104: {nearest_time} (差 {time_diff:.0f}s)")
+
+            # 檢查快取
+            s104_on_s102 = None
+            if nearest_time is not None and nearest_time in self._s104_interpolated_cache:
+                s104_on_s102 = self._s104_interpolated_cache[nearest_time]
+                print(f"[動態水深] 使用快取插值結果 (time={nearest_time})")
+            else:
+                # 執行插值
+                print(f"[動態水深] 執行插值計算...")
+                s104_on_s102 = self._interpolate_s104_onto_s102()
+
+                # 存入快取
+                if nearest_time is not None:
+                    # 快取大小限制（最多 50 個時間步）
+                    if len(self._s104_interpolated_cache) >= 50:
+                        oldest = next(iter(self._s104_interpolated_cache))
+                        del self._s104_interpolated_cache[oldest]
+                    self._s104_interpolated_cache[nearest_time] = s104_on_s102
+
+            # 【IHO S-98 Fallback】合併
+            s102_rows, s102_cols = self.s102_depth.shape
+            valid_s104 = np.sum(~np.isnan(s104_on_s102))
+            total_s102 = s102_rows * s102_cols
+            overlap_ratio = 100 * valid_s104 / total_s102
+
+            self.adjusted_depth = self.s102_depth.copy()
+            has_s104 = ~np.isnan(s104_on_s102)
+            self.adjusted_depth[has_s104] = self.s102_depth[has_s104] + s104_on_s102[has_s104]
+
+            print(f"  ✓ 計算完成 (重疊: {overlap_ratio:.1f}%)")
+            print(f"  調整後深度範圍: [{np.nanmin(self.adjusted_depth):.2f}, {np.nanmax(self.adjusted_depth):.2f}] m")
+
+            return self.adjusted_depth
+
+        except ImportError:
+            print("  ⚠ 缺少 scipy，嘗試直接疊加...")
+            if self.s102_depth.shape == self.s104_water_level.shape:
+                self.adjusted_depth = self.s102_depth.copy()
+                has_valid = ~np.isnan(self.s104_water_level)
+                self.adjusted_depth[has_valid] = self.s102_depth[has_valid] + self.s104_water_level[has_valid]
+                return self.adjusted_depth
+            return None
+
+        except Exception as e:
+            print(f"  ✗ 計算失敗: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def render_dynamic_depth(self, ax, extent=None):
+        """
+        渲染動態水深圖層 (使用 S-52 配色)
+        
+        Args:
+            ax: matplotlib axes 物件
+            extent: [lon_min, lon_max, lat_min, lat_max] 地理範圍
+            
+        Returns:
+            matplotlib.collections.QuadMesh: pcolormesh 返回物件
+        """
+        if self.adjusted_depth is None:
+            print("[渲染] 錯誤: 尚未計算動態水深")
+            return None
+        
+        print("\n[S-52 渲染] 開始渲染...")
+        print(f"  數據形狀: {self.adjusted_depth.shape}")
+        print(f"  配色標準: IHO S-52 Day Condition")
+        
+        # 使用 pcolormesh 渲染
+        mesh = ax.pcolormesh(
+            self.adjusted_depth,
+            cmap=self.colormap,
+            norm=self.norm,
+            shading='auto',
+            alpha=1.0  # NaN 區域會自動透明
+        )
+        
+        if extent:
+            ax.set_xlim(extent[0], extent[1])
+            ax.set_ylim(extent[2], extent[3])
+        
+        print("  ✓ 渲染完成")
+        
+        return mesh
+    
+    def _extract_crs_from_hdf5(self, hdf5_file, product_type='S-102'):
+        """從 HDF5 檔案中提取座標參考系統（CRS）資訊
+
+        Args:
+            hdf5_file: HDF5 檔案物件
+            product_type: 產品類型（'S-102' 或 'S-104'）
+
+        Returns:
+            dict: CRS 資訊，包含 EPSG 代碼、類型等
+        """
+        try:
+            # 根據產品類型選擇路徑
+            if product_type == 'S-102':
+                group_path = '/BathymetryCoverage/BathymetryCoverage.01'
+            else:  # S-104
+                group_path = '/WaterLevel/WaterLevel.01'
+
+            if not self._path_exists(hdf5_file, group_path):
+                print(f"  ⚠ 警告: 找不到 {product_type} CRS 資訊路徑")
+                return {'epsg': 4326, 'type': 'WGS84', 'is_projected': False}
+
+            group = hdf5_file[group_path]
+
+            # 讀取 horizontalDatumReference (EPSG 代碼)
+            epsg_code = 4326  # 預設 WGS84
+            if 'horizontalDatumReference' in group.attrs:
+                datum_ref = group.attrs['horizontalDatumReference']
+                if isinstance(datum_ref, bytes):
+                    datum_ref = datum_ref.decode('utf-8')
+
+                # 解析 EPSG 代碼
+                if 'EPSG' in str(datum_ref):
+                    # 例如: "EPSG:4326" or "EPSG::4326"
+                    parts = str(datum_ref).split(':')
+                    epsg_code = int([p for p in parts if p.isdigit()][0])
+
+            # 判斷是否為投影座標系統（UTM: EPSG 32601-32660, 32701-32760）
+            is_projected = False
+            is_utm = False
+            utm_zone = None
+
+            if 32601 <= epsg_code <= 32660:  # UTM North
+                is_projected = True
+                is_utm = True
+                utm_zone = epsg_code - 32600
+                hemisphere = 'N'
+            elif 32701 <= epsg_code <= 32760:  # UTM South
+                is_projected = True
+                is_utm = True
+                utm_zone = epsg_code - 32700
+                hemisphere = 'S'
+
+            crs_info = {
+                'epsg': epsg_code,
+                'type': 'UTM' if is_utm else 'WGS84',
+                'is_projected': is_projected,
+                'is_utm': is_utm,
+                'utm_zone': utm_zone,
+                'hemisphere': hemisphere if is_utm else None
+            }
+
+            print(f"  [{product_type}] CRS: EPSG:{epsg_code} ({crs_info['type']})")
+            if is_utm:
+                print(f"  [{product_type}] UTM Zone: {utm_zone}{hemisphere}")
+
+            return crs_info
+
+        except Exception as e:
+            print(f"  ⚠ 讀取 {product_type} CRS 時出錯: {e}")
+            return {'epsg': 4326, 'type': 'WGS84', 'is_projected': False}
+
+    def _convert_utm_to_wgs84(self, x, y, utm_zone, hemisphere='N'):
+        """將 UTM 座標轉換為 WGS84 (EPSG:4326)
+
+        Args:
+            x: UTM X 座標（Easting）
+            y: UTM Y 座標（Northing）
+            utm_zone: UTM 區域編號
+            hemisphere: 'N' 或 'S'
+
+        Returns:
+            tuple: (longitude, latitude)
+        """
+        try:
+            from pyproj import Transformer
+
+            # 建立 UTM -> WGS84 轉換器
+            epsg_utm = 32600 + utm_zone if hemisphere == 'N' else 32700 + utm_zone
+            transformer = Transformer.from_crs(f"EPSG:{epsg_utm}", "EPSG:4326", always_xy=True)
+
+            lon, lat = transformer.transform(x, y)
+            return lon, lat
+
+        except ImportError:
+            print("  ⚠ 警告: 缺少 pyproj 庫，無法轉換 UTM 座標")
+            print("  請安裝: pip install pyproj")
+            return x, y
+        except Exception as e:
+            print(f"  ⚠ UTM 轉換錯誤: {e}")
+            return x, y
+
+    def _detect_utm_zone_from_coords(self, easting, northing):
+        """根據座標值啟發式判斷 UTM 區域
+
+        Args:
+            easting: Easting (X) 或經度
+            northing: Northing (Y) 或緯度
+
+        Returns:
+            dict: UTM 資訊，如果不是 UTM 則返回 None
+        """
+        # 啟發式判斷：如果座標值超出經緯度範圍，很可能是 UTM
+        if abs(easting) > 180 or abs(northing) > 90:
+            # 這是投影座標（米），不是地理座標（度）
+            print(f"  [啟發式檢測] 座標值 [{easting:.0f}, {northing:.0f}] 超出經緯度範圍")
+            print(f"  [啟發式檢測] 判定為 UTM 投影座標")
+
+            # 估算半球
+            hemisphere = 'N' if northing > 0 else 'S'
+
+            # 智能估算 UTM Zone
+            # 方法：嘗試附近幾個可能的 zone，看哪個轉換後的經度最合理
+            best_zone = None
+            best_lon = None
+
+            # 根據 Easting 範圍粗略估計可能的 zone 範圍
+            # UTM Easting 典型範圍: 166000 - 833000
+            # 中央經度 = (zone - 1) * 6 - 180 + 3
+            # 粗略估算中央經度
+            possible_zones = range(1, 61)  # UTM zone 1-60
+
+            # 對於常見區域做優化
+            if 160000 <= easting <= 840000 and 0 <= abs(northing) <= 10000000:
+                # 這是有效的 UTM 座標範圍
+                # 根據 Easting 和 Northing 的數值範圍縮小搜索
+                if 600000 <= easting <= 800000 and 5000000 <= northing <= 7000000:
+                    # 可能是歐洲（zone 28-38）
+                    possible_zones = range(28, 39)
+                    print(f"  [啟發式檢測] 座標範圍符合歐洲區域，測試 Zone 28-38")
+                elif 200000 <= easting <= 800000 and 6000000 <= northing <= 8000000:
+                    # 北歐或中歐
+                    possible_zones = range(30, 38)
+
+            # 找到**最合理**的 zone
+            # 策略：選擇讓 Easting 最接近標準值 500000 的 zone
+            best_easting_score = float('inf')
+            candidates = []  # 記錄所有候選 zone
+
+            for zone in possible_zones:
+                try:
+                    lon, lat = self._convert_utm_to_wgs84(
+                        easting, northing,
+                        zone, hemisphere
+                    )
+
+                    # 檢查轉換後的經緯度是否合理
+                    if -180 <= lon <= 180 and -90 <= lat <= 90:
+                        # 計算這個 zone 的中央經度
+                        central_meridian = (zone - 1) * 6 - 180 + 3
+
+                        # 計算偏離中央經度的距離
+                        distance = abs(lon - central_meridian)
+
+                        # UTM zone 有效範圍：中央經度 ± 3°（標準範圍）
+                        # Easting 標準範圍：166000 - 834000，中心值 500000
+                        # 計算 Easting 偏離 500000 的程度（越小越好）
+                        easting_score = abs(easting - 500000)
+
+                        if distance < 3:  # 優先選擇在標準範圍內的（±3°）
+                            candidates.append({
+                                'zone': zone,
+                                'lon': lon,
+                                'lat': lat,
+                                'distance': distance,
+                                'easting_score': easting_score,
+                                'central_meridian': central_meridian
+                            })
+
+                            # 選擇策略：對於中歐/西歐數據
+                            # 當偏離距離很接近時（< 3°），選擇讓轉換後經度在該 zone 標準範圍西半部的
+                            # 這樣可以避免選擇過東的 zone
+                            zone_west_boundary = (zone - 1) * 6 - 180
+                            zone_east_boundary = zone * 6 - 180
+
+                            # 檢查轉換後的經度是否在 zone 的西半部（中央經度以西）
+                            in_west_half = lon < central_meridian
+
+                            if best_zone is None:
+                                # 第一個候選，直接接受
+                                best_distance = distance
+                                best_zone = zone
+                                best_lon = lon
+                            elif distance < best_distance:
+                                # 偏離距離更小，接受
+                                best_distance = distance
+                                best_zone = zone
+                                best_lon = lon
+                            elif abs(distance - best_distance) < 0.1:
+                                # 偏離距離基本相同，優先選擇在西半部的或 zone 編號較小的
+                                if in_west_half or zone < best_zone:
+                                    best_distance = distance
+                                    best_zone = zone
+                                    best_lon = lon
+                        elif distance < 6:  # 次優選擇（±6°）
+                            candidates.append({
+                                'zone': zone,
+                                'lon': lon,
+                                'lat': lat,
+                                'distance': distance,
+                                'easting_score': easting_score,
+                                'central_meridian': central_meridian
+                            })
+                            # 只在沒找到標準範圍內的 zone 時才考慮
+                            if best_zone is None and easting_score < best_easting_score:
+                                best_easting_score = easting_score
+                                best_distance = distance
+                                best_zone = zone
+                                best_lon = lon
+                except:
+                    continue
+
+            # 顯示所有候選結果
+            if len(candidates) > 1:
+                print(f"  [啟發式檢測] 找到 {len(candidates)} 個候選 Zone:")
+                for cand in candidates:
+                    marker = " ← 選中" if cand['zone'] == best_zone else ""
+                    print(f"    Zone {cand['zone']}{hemisphere}: 經度 {cand['lon']:.5f}° (中央經度 {cand['central_meridian']:.0f}°, 偏離 {cand['distance']:.2f}°){marker}")
+
+            if best_zone is None:
+                # 如果沒找到，使用預設值
+                best_zone = 33  # 中歐預設
+                print(f"  [啟發式檢測] 無法確定 Zone，使用預設值: {best_zone}{hemisphere}")
+            else:
+                central_meridian = (best_zone - 1) * 6 - 180 + 3
+                print(f"  [啟發式檢測] 智能估算 UTM Zone: {best_zone}{hemisphere}")
+                print(f"  [啟發式檢測] Zone {best_zone} 中央經度: {central_meridian:.1f}°")
+                print(f"  [啟發式檢測] 轉換後經度: {best_lon:.5f}° (偏離中央經度 {best_distance:.2f}°)")
+
+            return {
+                'is_utm': True,
+                'utm_zone': best_zone,
+                'hemisphere': hemisphere
+            }
+
+        return None
+
+    def _extract_s102_geotransform(self, hdf5_file, data_path):
+        """從 S-102 HDF5 檔案中提取地理參考資訊（簡化版，直接使用元數據）"""
+        try:
+            # 提取 CRS 資訊
+            self.s102_crs = self._extract_crs_from_hdf5(hdf5_file, 'S-102')
+
+            # 從 BathymetryCoverage.01 組中讀取 attributes
+            coverage_group_path = '/BathymetryCoverage/BathymetryCoverage.01'
+
+            if self._path_exists(hdf5_file, coverage_group_path):
+                group = hdf5_file[coverage_group_path]
+
+                # 輔助函數：安全讀取屬性
+                def get_attr(name, default):
+                    value = group.attrs.get(name, default)
+                    if hasattr(value, '__len__') and not isinstance(value, (str, bytes)):
+                        return value[0] if len(value) == 1 else value
+                    if isinstance(value, bytes):
+                        return value.decode('utf-8', errors='ignore')
+                    return value
+
+                # 讀取地理參考參數
+                origin_lon = get_attr('gridOriginLongitude', -71.16)
+                origin_lat = get_attr('gridOriginLatitude', 46.82)
+                spacing_lon = get_attr('gridSpacingLongitudinal', 0.00002)
+                spacing_lat = get_attr('gridSpacingLatitudinal', 0.00002)
+                num_points_lon = get_attr('numPointsLongitudinal', 1000)
+                num_points_lat = get_attr('numPointsLatitudinal', 1000)
+
+                # 讀取邊界值（優先使用這些）
+                west_bound = get_attr('westBoundLongitude', None)
+                east_bound = get_attr('eastBoundLongitude', None)
+                south_bound = get_attr('southBoundLatitude', None)
+                north_bound = get_attr('northBoundLatitude', None)
+
+                print(f"  [S-102] 原始元數據:")
+                print(f"    gridOrigin: ({origin_lon}, {origin_lat})")
+                print(f"    gridSpacing: ({spacing_lon}, {spacing_lat})")
+                print(f"    numPoints: ({num_points_lon}, {num_points_lat})")
+                if west_bound is not None:
+                    print(f"    邊界: W={west_bound:.6f}, E={east_bound:.6f}, S={south_bound:.6f}, N={north_bound:.6f}")
+
+                # 【關鍵修正】檢測元數據不一致：CRS 聲稱 4326 但座標值像 UTM
+                is_utm = self.s102_crs.get('type') == 'UTM' and self.s102_crs.get('is_utm', False)
+
+                # 啟發式檢測：座標值超出經緯度範圍 → 實際是 UTM
+                if not is_utm and (abs(origin_lon) > 180 or abs(origin_lat) > 90 or
+                                   (west_bound and (abs(west_bound) > 180 or abs(south_bound) > 90))):
+                    print(f"  [S-102] ⚠ 警告: CRS 聲稱 EPSG:{self.s102_crs.get('epsg')}，但座標值超出範圍！")
+                    print(f"    座標值: ({origin_lon}, {origin_lat})")
+                    print(f"  → 判定為 UTM 投影（元數據錯誤）")
+
+                    # 根據檔案名稱或座標值估算 Zone
+                    import os
+                    filename = os.path.basename(hdf5_file.filename) if hasattr(hdf5_file, 'filename') else ''
+
+                    # 德國數據判定：使用雙重驗證（先嘗試 Zone 32，再驗證經度）
+                    if 'DE' in filename.upper() or '102DE' in filename.upper():
+                        # 德國橫跨 Zone 32N (6°E-12°E) 和 Zone 33N (12°E-18°E)
+                        # 策略：先以 Zone 32N 轉換，若經度 > 12°E 則改用 Zone 33N
+                        hemisphere = 'N'
+                        from pyproj import Transformer
+                        try:
+                            # 嘗試 Zone 32N
+                            tf32 = Transformer.from_crs("EPSG:32632", "EPSG:4326", always_xy=True)
+                            lon32, lat32 = tf32.transform(origin_lon, origin_lat)
+
+                            # 嘗試 Zone 33N
+                            tf33 = Transformer.from_crs("EPSG:32633", "EPSG:4326", always_xy=True)
+                            lon33, lat33 = tf33.transform(origin_lon, origin_lat)
+
+                            print(f"  → 德國數據雙 Zone 驗證:")
+                            print(f"    Zone 32N → ({lon32:.6f}°, {lat32:.6f}°)")
+                            print(f"    Zone 33N → ({lon33:.6f}°, {lat33:.6f}°)")
+
+                            # 判定：Zone 32N 的有效經度範圍為 6°-12°E
+                            #        Zone 33N 的有效經度範圍為 12°-18°E
+                            # 選擇轉換後經度落在對應 Zone 有效範圍內的那個
+                            if 6.0 <= lon32 <= 12.0 and 47.0 <= lat32 <= 56.0:
+                                utm_zone = 32
+                                print(f"  → 經度 {lon32:.4f}° 在 Zone 32N 範圍 (6°-12°E) 內，選擇 Zone 32N")
+                            elif 12.0 <= lon33 <= 18.0 and 47.0 <= lat33 <= 56.0:
+                                utm_zone = 33
+                                print(f"  → 經度 {lon33:.4f}° 在 Zone 33N 範圍 (12°-18°E) 內，選擇 Zone 33N")
+                            elif lon32 > 12.0:
+                                # Zone 32 轉出的經度超過 12°E，改用 Zone 33
+                                utm_zone = 33
+                                print(f"  → Zone 32N 轉出經度 {lon32:.4f}° > 12°，切換至 Zone 33N")
+                            else:
+                                utm_zone = 32
+                                print(f"  → 預設使用 Zone 32N")
+                        except Exception as e_de:
+                            print(f"  → 德國雙 Zone 驗證失敗: {e_de}，使用預設 Zone 32N")
+                            utm_zone = 32
+
+                        print(f"  → 檢測到德國數據，最終使用 UTM Zone {utm_zone}{hemisphere}")
+                    else:
+                        # 通用估算：使用 _detect_utm_zone_from_coords 進行智能判定
+                        hemisphere = 'N' if origin_lat > 0 else 'S'
+                        detected = self._detect_utm_zone_from_coords(origin_lon, origin_lat)
+                        if detected:
+                            utm_zone = detected['utm_zone']
+                            hemisphere = detected['hemisphere']
+                        else:
+                            utm_zone = 33  # 中歐預設
+                        print(f"  → 估算 UTM Zone: {utm_zone}{hemisphere}")
+
+                    is_utm = True
+                    self.s102_crs['is_utm'] = True
+                    self.s102_crs['utm_zone'] = utm_zone
+                    self.s102_crs['hemisphere'] = hemisphere
+                    self.s102_crs['type'] = 'UTM'
+                    self.s102_crs['epsg'] = 32600 + utm_zone
+
+                if is_utm:
+                    # 【原生投影策略】保留 UTM 座標，讓 QGIS OTF 引擎精確處理投影
+                    # 不再手動轉為 WGS84 度數（避免線性近似誤差和累積偏移）
+                    utm_epsg = self.s102_crs['epsg']
+                    self.output_epsg = utm_epsg
+                    print(f"  [S-102] 使用原生投影 EPSG:{utm_epsg} (UTM Zone {self.s102_crs['utm_zone']}{self.s102_crs.get('hemisphere', 'N')})")
+                    print(f"    → 由 QGIS OTF 引擎處理精確投影變換，避免線性近似誤差")
+
+                    # 【驗證】將原點轉為 WGS84 僅供日誌驗證，不用於 Geotransform
+                    from pyproj import Transformer
+                    validator = Transformer.from_crs(f"EPSG:{utm_epsg}", "EPSG:4326", always_xy=True)
+                    check_lon, check_lat = validator.transform(origin_lon, origin_lat)
+                    print(f"    原點 UTM: ({origin_lon:.0f}, {origin_lat:.0f})")
+                    print(f"    原點 WGS84 (驗證用): ({check_lon:.6f}°, {check_lat:.6f}°)")
+
+                    # 驗證區域合理性
+                    import os
+                    filename_check = os.path.basename(hdf5_file.filename) if hasattr(hdf5_file, 'filename') else ''
+                    expected_regions = {
+                        'DE': {'name': '德國 (Zone 32N/33N)', 'lon_range': (5.5, 18.5), 'lat_range': (47.0, 56.0)},
+                        'CA': {'name': 'Canada', 'lon_range': (-72.0, -70.0), 'lat_range': (46.0, 48.0)}
+                    }
+                    for code, expected in expected_regions.items():
+                        if code in filename_check.upper():
+                            lon_ok = expected['lon_range'][0] <= check_lon <= expected['lon_range'][1]
+                            lat_ok = expected['lat_range'][0] <= check_lat <= expected['lat_range'][1]
+                            if lon_ok and lat_ok:
+                                print(f"    ✓ 座標驗證通過 ({expected['name']})")
+                            else:
+                                print(f"    ✗ 警告: 座標 ({check_lon:.4f}°, {check_lat:.4f}°) 超出 {expected['name']} 預期範圍")
+                            break
+
+                    # 直接使用原始 UTM 數值，不轉換
+                    # spacing 保持公尺單位（UTM 原生）
+                    print(f"    spacing: {spacing_lon:.1f}m x {spacing_lat:.1f}m (原生 UTM)")
+                else:
+                    # EPSG:4326 或其他地理座標系，直接使用度數
+                    self.output_epsg = self.s102_crs.get('epsg', 4326)
+                    print(f"  [S-102] 座標值在正常範圍內，直接使用 (EPSG:{self.output_epsg})")
+
+                # 【半像素偏移校正 (Point-to-Area)】
+                # S-102 gridOrigin 定義在第一個網格點的中心 (Cell Center)
+                # GDAL Geotransform 需要像素的左上角邊緣 (Cell Edge)
+                # 校正：origin_edge = origin_center - spacing / 2
+                origin_lon_edge = origin_lon - spacing_lon / 2.0
+                origin_lat_edge = origin_lat - spacing_lat / 2.0
+
+                # S-102 的 gridOrigin 是左下角 → 計算左上角 Y
+                # 從邊緣計算：top_left_y = bottom_left_y_edge + num_points * spacing
+                top_left_y = origin_lat_edge + (num_points_lat * spacing_lat)
+
+                print(f"  [S-102] 半像素校正:")
+                print(f"    gridOrigin (中心): ({origin_lon}, {origin_lat})")
+                print(f"    校正後邊緣: ({origin_lon_edge}, {origin_lat_edge})")
+
+                # 構建 GDAL geotransform
+                # 格式: [左上角X, 像素寬度, 旋轉, 左上角Y, 旋轉, 像素高度(負值)]
+                self.s102_geotransform = [
+                    origin_lon_edge,   # 左上角 X（像素邊緣）
+                    spacing_lon,       # 像素寬度（UTM 時為公尺，4326 時為度）
+                    0,
+                    top_left_y,        # 左上角 Y（像素邊緣）
+                    0,
+                    -spacing_lat       # 像素高度（負值）
+                ]
+
+                self.geotransform = self.s102_geotransform  # 保持向後兼容
+
+                # 計算並顯示最終範圍
+                east_edge = origin_lon_edge + (num_points_lon * spacing_lon)
+                south_edge = top_left_y - (num_points_lat * spacing_lat)
+
+                unit = 'm' if is_utm else '°'
+                print(f"  [S-102] 最終地理參考 (EPSG:{self.output_epsg}):")
+                print(f"    左下角: ({origin_lon_edge:.2f}{unit}, {south_edge:.2f}{unit})")
+                print(f"    右上角: ({east_edge:.2f}{unit}, {top_left_y:.2f}{unit})")
+                print(f"    Geotransform: {self.s102_geotransform}")
+                print(f"    輸出 EPSG: {self.output_epsg}")
+
+            else:
+                print("  ⚠ 警告: 無法讀取 S-102 地理參考資訊，使用預設值")
+                self.s102_geotransform = [-71.16, 0.00002, 0, 46.84, 0, -0.00002]
+                self.geotransform = self.s102_geotransform
+                self.s102_crs = {'epsg': 4326, 'type': 'WGS84', 'is_projected': False}
+
+        except Exception as e:
+            print(f"  ⚠ 讀取 S-102 地理參考時出錯: {e}")
+            import traceback
+            traceback.print_exc()
+            self.s102_geotransform = [-71.16, 0.00002, 0, 46.84, 0, -0.00002]
+            self.geotransform = self.s102_geotransform
+            self.s102_crs = {'epsg': 4326, 'type': 'WGS84', 'is_projected': False}
+
+    def _extract_s104_geotransform(self, hdf5_file, data_path):
+        """從 S-104 HDF5 檔案中提取地理參考資訊（簡化版，直接使用元數據）"""
+        try:
+            # 提取 CRS 資訊
+            self.s104_crs = self._extract_crs_from_hdf5(hdf5_file, 'S-104')
+
+            # 從 WaterLevel.01 組中讀取 attributes
+            coverage_group_path = '/WaterLevel/WaterLevel.01'
+
+            if self._path_exists(hdf5_file, coverage_group_path):
+                group = hdf5_file[coverage_group_path]
+
+                # 輔助函數：安全讀取屬性
+                def get_attr(name, default):
+                    value = group.attrs.get(name, default)
+                    if hasattr(value, '__len__') and not isinstance(value, (str, bytes)):
+                        return value[0] if len(value) == 1 else value
+                    if isinstance(value, bytes):
+                        return value.decode('utf-8', errors='ignore')
+                    return value
+
+                # 讀取地理參考參數
+                origin_lon = get_attr('gridOriginLongitude', -71.16)
+                origin_lat = get_attr('gridOriginLatitude', 46.82)
+                spacing_lon = get_attr('gridSpacingLongitudinal', 0.00002)
+                spacing_lat = get_attr('gridSpacingLatitudinal', 0.00002)
+                num_points_lon = get_attr('numPointsLongitudinal', 1000)
+                num_points_lat = get_attr('numPointsLatitudinal', 1000)
+
+                # 讀取邊界值
+                west_bound = get_attr('westBoundLongitude', None)
+                east_bound = get_attr('eastBoundLongitude', None)
+                south_bound = get_attr('southBoundLatitude', None)
+                north_bound = get_attr('northBoundLatitude', None)
+
+                print(f"  [S-104] 原始元數據:")
+                print(f"    gridOrigin: ({origin_lon}, {origin_lat})")
+                print(f"    gridSpacing: ({spacing_lon}, {spacing_lat})")
+                print(f"    numPoints: ({num_points_lon}, {num_points_lat})")
+                if west_bound is not None:
+                    print(f"    邊界: W={west_bound:.6f}, E={east_bound:.6f}, S={south_bound:.6f}, N={north_bound:.6f}")
+
+                # 判斷是否需要從 UTM 轉換（只有當 EPSG 明確是 UTM 時）
+                is_utm = self.s104_crs.get('type') == 'UTM' and self.s104_crs.get('is_utm', False)
+
+                # 【自動校正】CRS 聲稱 4326 但座標值像 UTM（與 S-102 同樣的 fallback）
+                if not is_utm and (abs(origin_lon) > 180 or abs(origin_lat) > 90 or
+                                   (west_bound and (abs(west_bound) > 180 or abs(south_bound) > 90))):
+                    print(f"  [S-104] ⚠ 警告: CRS 聲稱 EPSG:{self.s104_crs.get('epsg')}，但座標值超出範圍！")
+                    print(f"    座標值: ({origin_lon}, {origin_lat})")
+                    print(f"  → 判定為 UTM 投影（元數據錯誤），啟動自動校正...")
+
+                    import os
+                    filename = os.path.basename(hdf5_file.filename) if hasattr(hdf5_file, 'filename') else ''
+                    hemisphere = 'N' if origin_lat > 0 else 'S'
+
+                    if 'DE' in filename.upper() or '104DE' in filename.upper():
+                        # 德國雙 Zone 驗證
+                        from pyproj import Transformer
+                        try:
+                            tf32 = Transformer.from_crs("EPSG:32632", "EPSG:4326", always_xy=True)
+                            lon32, lat32 = tf32.transform(origin_lon, origin_lat)
+                            tf33 = Transformer.from_crs("EPSG:32633", "EPSG:4326", always_xy=True)
+                            lon33, lat33 = tf33.transform(origin_lon, origin_lat)
+
+                            print(f"  → 德國數據雙 Zone 驗證:")
+                            print(f"    Zone 32N → ({lon32:.6f}°, {lat32:.6f}°)")
+                            print(f"    Zone 33N → ({lon33:.6f}°, {lat33:.6f}°)")
+
+                            if 6.0 <= lon32 <= 12.0 and 47.0 <= lat32 <= 56.0:
+                                utm_zone = 32
+                            elif 12.0 <= lon33 <= 18.0 and 47.0 <= lat33 <= 56.0:
+                                utm_zone = 33
+                            elif lon32 > 12.0:
+                                utm_zone = 33
+                            else:
+                                utm_zone = 32
+                        except Exception:
+                            utm_zone = 32
+                        print(f"  → 檢測到德國數據，使用 UTM Zone {utm_zone}{hemisphere}")
+                    else:
+                        detected = self._detect_utm_zone_from_coords(origin_lon, origin_lat)
+                        if detected:
+                            utm_zone = detected['utm_zone']
+                            hemisphere = detected['hemisphere']
+                        else:
+                            utm_zone = 33
+                        print(f"  → 估算 UTM Zone: {utm_zone}{hemisphere}")
+
+                    is_utm = True
+                    self.s104_crs['is_utm'] = True
+                    self.s104_crs['utm_zone'] = utm_zone
+                    self.s104_crs['hemisphere'] = hemisphere
+                    self.s104_crs['type'] = 'UTM'
+                    self.s104_crs['epsg'] = 32600 + utm_zone if hemisphere == 'N' else 32700 + utm_zone
+
+                if is_utm:
+                    # 【原生投影策略】保留 UTM 座標，與 S-102 統一在相同投影下
+                    utm_epsg = self.s104_crs['epsg']
+                    print(f"  [S-104] 使用原生投影 EPSG:{utm_epsg} (UTM Zone {self.s104_crs['utm_zone']}{self.s104_crs.get('hemisphere', 'N')})")
+
+                    # 驗證用（僅日誌）
+                    from pyproj import Transformer
+                    validator = Transformer.from_crs(f"EPSG:{utm_epsg}", "EPSG:4326", always_xy=True)
+                    check_lon, check_lat = validator.transform(origin_lon, origin_lat)
+                    print(f"    原點 UTM: ({origin_lon:.0f}, {origin_lat:.0f})")
+                    print(f"    原點 WGS84 (驗證用): ({check_lon:.6f}°, {check_lat:.6f}°)")
+                    print(f"    spacing: {spacing_lon:.1f}m x {spacing_lat:.1f}m (原生 UTM)")
+
+                    # 如果 S-102 是不同的 UTM Zone，需要將 S-104 轉換到 S-102 的 CRS
+                    s102_epsg = self.output_epsg
+                    if s102_epsg != utm_epsg and s102_epsg != 4326:
+                        print(f"  [S-104] ⚠ S-104 EPSG:{utm_epsg} 與 S-102 EPSG:{s102_epsg} 不同，進行跨帶轉換...")
+                        cross_tf = Transformer.from_crs(f"EPSG:{utm_epsg}", f"EPSG:{s102_epsg}", always_xy=True)
+                        origin_lon, origin_lat = cross_tf.transform(origin_lon, origin_lat)
+                        if west_bound is not None and abs(west_bound) > 180:
+                            west_bound, south_bound = cross_tf.transform(west_bound, south_bound)
+                            east_bound, north_bound = cross_tf.transform(east_bound, north_bound)
+                        print(f"    轉換後原點: ({origin_lon:.0f}, {origin_lat:.0f}) [EPSG:{s102_epsg}]")
+                else:
+                    print(f"  [S-104] CRS 為 EPSG:{self.s104_crs.get('epsg', 4326)}，直接使用元數據值")
+
+                    # 如果 S-102 是 UTM 而 S-104 是 4326，需要將 S-104 轉換到 S-102 的 UTM
+                    s102_epsg = self.output_epsg
+                    if s102_epsg != 4326:
+                        print(f"  [S-104] S-102 使用 EPSG:{s102_epsg}，將 S-104 WGS84 座標轉換至 UTM...")
+                        from pyproj import Transformer
+                        to_utm = Transformer.from_crs("EPSG:4326", f"EPSG:{s102_epsg}", always_xy=True)
+                        origin_lon, origin_lat = to_utm.transform(origin_lon, origin_lat)
+                        if west_bound is not None:
+                            west_bound, south_bound = to_utm.transform(west_bound, south_bound)
+                            east_bound, north_bound = to_utm.transform(east_bound, north_bound)
+                        # spacing 從度轉為公尺（近似）
+                        from pyproj import Transformer as _Tf
+                        check_tf = _Tf.from_crs("EPSG:4326", f"EPSG:{s102_epsg}", always_xy=True)
+                        x1, y1 = check_tf.transform(0, origin_lat)
+                        x2, y2 = check_tf.transform(spacing_lon, origin_lat)
+                        spacing_lon = abs(x2 - x1)
+                        x1, y1 = check_tf.transform(0, origin_lat)
+                        x2, y2 = check_tf.transform(0, origin_lat + spacing_lat)
+                        spacing_lat = abs(y2 - y1)
+                        print(f"    轉換後原點: ({origin_lon:.0f}, {origin_lat:.0f}) [EPSG:{s102_epsg}]")
+                        print(f"    轉換後 spacing: {spacing_lon:.1f}m x {spacing_lat:.1f}m")
+
+                # 【半像素偏移校正】與 S-102 保持一致
+                origin_lon_edge = origin_lon - spacing_lon / 2.0
+                origin_lat_edge = origin_lat - spacing_lat / 2.0
+                top_left_y = origin_lat_edge + (num_points_lat * spacing_lat)
+
+                # 構建 GDAL geotransform（原生投影座標）
+                self.s104_geotransform = [
+                    origin_lon_edge,
+                    spacing_lon,
+                    0,
+                    top_left_y,
+                    0,
+                    -spacing_lat
+                ]
+
+                east_edge = origin_lon_edge + (num_points_lon * spacing_lon)
+                south_edge = top_left_y - (num_points_lat * spacing_lat)
+
+                unit = 'm' if is_utm or self.output_epsg != 4326 else '°'
+                print(f"  [S-104] 最終地理參考:")
+                print(f"    X 範圍: {origin_lon_edge:.2f}{unit} 至 {east_edge:.2f}{unit}")
+                print(f"    Y 範圍: {south_edge:.2f}{unit} 至 {top_left_y:.2f}{unit}")
+
+            else:
+                print("  ⚠ 警告: 無法讀取 S-104 地理參考資訊")
+                self.s104_geotransform = None
+                self.s104_crs = {'epsg': 4326, 'type': 'WGS84', 'is_projected': False}
+
+        except Exception as e:
+            print(f"  ⚠ 讀取 S-104 地理參考時出錯: {e}")
+            import traceback
+            traceback.print_exc()
+            self.s104_geotransform = None
+            self.s104_crs = {'epsg': 4326, 'type': 'WGS84', 'is_projected': False}
+
+    def _path_exists(self, hdf5_file, path):
+        """檢查 HDF5 檔案中是否存在指定路徑"""
+        try:
+            parts = path.strip('/').split('/')
+            current = hdf5_file
+            for part in parts:
+                if part in current:
+                    current = current[part]
+                else:
+                    return False
+            return True
+        except:
+            return False

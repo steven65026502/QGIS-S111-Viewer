@@ -1,2 +1,58 @@
 __pycache__/
 *.pyc
+
+# Local data, generated outputs, and temporary verification files
+data/
+logs/
+*.log
+deliverables/
+qml_styles/
+s111_workstation_bundle/
+scan_mode_demo_nc/
+scan_wait_demo_nc/
+tmp*/
+tmp_*
+*_report.json
+*_preview_*
+*_crop_*
+*.csv
+
+# Documents and presentation build artifacts
+*.pdf
+*.pptx
+oral_defense_*.js
+build_oral_defense_*.js
+S-111_*展開版.js
+Possible Problems.txt
+RESULT_PACKAGE_FIELD_GUIDE.md
+S102_S104_使用說明.md
+TASK_SCHEDULER_SETUP.md
+S111_BORDER_WIDTH_UPDATE.md
+S111_COLOR_SPECIFICATION_REPORT.md
+teacher_feedback_*
+老師要求_*.md
+
+# Local utility, research pipeline, and test scripts
+generate_spatial_stats_qml.py
+inspect_nc.py
+nc_to_s111_converter.py
+qgis_daily_hotspot_maps.py
+qgis_spatial_error_stat_maps.py
+run_pipeline_local.ps1
+run_s111_pipeline.bat
+summarize_hotspot_metrics.py
+test_*.py
+verification_pipeline.py
+
+# Large/local scientific data and databases
+*.nc
+*.h5
+*.hdf5
+*.db
+*.sqlite
+*.sqlite3
+
+# Local backups
+*.backup*
+*.bak
+*.orig

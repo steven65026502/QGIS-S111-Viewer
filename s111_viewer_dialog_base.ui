@@ -19,7 +19,7 @@
      <item>
       <widget class="QLabel" name="lblFile">
        <property name="text">
-        <string>S-111 文件：</string>
+        <string>S-102/S-104/S-111 Dataset Source：</string>
        </property>
       </widget>
      </item>
@@ -35,7 +35,33 @@
    <item>
     <widget class="QPushButton" name="btnBrowse">
      <property name="text">
-      <string>瀏覽...</string>
+      <string>Browse...</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QPushButton" name="btnLoadComparison">
+     <property name="styleSheet">
+      <string notr="true">background-color: #ffcccc;</string>
+     </property>
+     <property name="text">
+      <string>load_comparison</string>
+     </property>
+     <property name="toolTip">
+      <string>load_comparison：用今天後報驗證前三天預報的不確定性</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QPushButton" name="btnLoadFromDB">
+     <property name="styleSheet">
+      <string notr="true">background-color: #cce5ff;</string>
+     </property>
+     <property name="text">
+      <string>從資料庫載入熱點</string>
+     </property>
+     <property name="toolTip">
+      <string>從 PostgreSQL 讀取最新驗證結果，顯示熱點於地圖</string>
      </property>
     </widget>
    </item>
@@ -49,7 +75,7 @@
    <item>
     <widget class="QLabel" name="label">
      <property name="text">
-      <string>動畫間隔：</string>
+      <string>Time Step：</string>
      </property>
     </widget>
    </item>
@@ -58,7 +84,7 @@
      <item>
       <widget class="QLabel" name="lblTime">
        <property name="text">
-        <string>時間：</string>
+        <string>Time：</string>
        </property>
       </widget>
      </item>
@@ -68,22 +94,22 @@
     <widget class="QComboBox" name="comboBox">
      <item>
       <property name="text">
-       <string>15分鐘</string>
+       <string>15 min</string>
       </property>
      </item>
      <item>
       <property name="text">
-       <string>30分鐘</string>
+       <string>30 min</string>
       </property>
      </item>
      <item>
       <property name="text">
-       <string>45分鐘</string>
+       <string>45 min</string>
       </property>
      </item>
      <item>
       <property name="text">
-       <string>60分鐘</string>
+       <string>60 min</string>
       </property>
      </item>
     </widget>
@@ -91,7 +117,7 @@
    <item>
     <widget class="QLabel" name="StartTime">
      <property name="text">
-      <string>開始時間:</string>
+      <string>Start Timestamp:</string>
      </property>
     </widget>
    </item>
@@ -129,7 +155,7 @@
    <item>
     <widget class="QLabel" name="EndTime">
      <property name="text">
-      <string>結束時間:</string>
+      <string>End Timestamp:</string>
      </property>
     </widget>
    </item>
@@ -181,93 +207,191 @@
    <item>
     <widget class="QGroupBox" name="groupAnimation">
      <property name="title">
-      <string>動畫控制</string>
+      <string>Animation control</string>
      </property>
     </widget>
    </item>
    <item>
-    <widget class="QPushButton" name="btnPlay">
-     <property name="text">
-      <string>播放</string>
-     </property>
-    </widget>
-   </item>
-   <item>
-    <widget class="QPushButton" name="btnPause">
-     <property name="text">
-      <string>暫停</string>
-     </property>
-    </widget>
-   </item>
-   <item>
-    <widget class="QPushButton" name="btnStop">
-     <property name="text">
-      <string>停止</string>
-     </property>
-    </widget>
-   </item>
-   <item>
-    <widget class="QTextBrowser" name="lblAnimationInterval">
-     <property name="sizePolicy">
-      <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
-       <horstretch>1</horstretch>
-       <verstretch>0</verstretch>
-      </sizepolicy>
-     </property>
-    </widget>
+    <layout class="QHBoxLayout" name="horizontalLayout_4">
+     <item>
+      <widget class="QPushButton" name="btnPlay">
+       <property name="text">
+        <string>Animate</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="btnPause">
+       <property name="text">
+        <string>Pause</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
    </item>
    <item>
     <widget class="QGroupBox" name="groupMetadata">
      <property name="title">
-      <string>元數據</string>
+      <string>Metadata</string>
      </property>
     </widget>
    </item>
    <item>
-    <widget class="QDialogButtonBox" name="buttonBox">
-     <property name="orientation">
-      <enum>Qt::Horizontal</enum>
+    <widget class="QGroupBox" name="groupResultPackage">
+     <property name="title">
+      <string>成果包模式 Result Package</string>
      </property>
-     <property name="standardButtons">
-      <set>QDialogButtonBox::Cancel|QDialogButtonBox::Ok</set>
-     </property>
+     <layout class="QVBoxLayout" name="verticalLayout_rp">
+      <item>
+       <layout class="QHBoxLayout" name="hLayoutManifest">
+        <item>
+         <widget class="QLineEdit" name="txtManifestPath">
+          <property name="readOnly">
+           <bool>true</bool>
+          </property>
+          <property name="placeholderText">
+           <string>選擇 manifest.json…</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QPushButton" name="btnBrowseManifest">
+          <property name="text">
+           <string>Browse…</string>
+          </property>
+         </widget>
+        </item>
+       </layout>
+      </item>
+      <item>
+       <widget class="QLabel" name="lblPackageDate">
+        <property name="text">
+         <string>日期：—</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <layout class="QHBoxLayout" name="hLayoutOffset">
+        <item>
+         <widget class="QLabel" name="lblOffset">
+          <property name="text">
+           <string>Offset：</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QComboBox" name="comboOffset">
+          <item>
+           <property name="text">
+            <string>24h</string>
+           </property>
+          </item>
+          <item>
+           <property name="text">
+            <string>48h</string>
+           </property>
+          </item>
+          <item>
+           <property name="text">
+            <string>72h</string>
+           </property>
+          </item>
+         </widget>
+        </item>
+       </layout>
+      </item>
+      <item>
+       <layout class="QHBoxLayout" name="hLayoutRPOptions">
+        <item>
+         <widget class="QCheckBox" name="chkLoadHotspots">
+          <property name="text">
+           <string>Hotspots</string>
+          </property>
+          <property name="checked">
+           <bool>true</bool>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QCheckBox" name="chkLoadSpatialStats">
+          <property name="text">
+           <string>Spatial Stats</string>
+          </property>
+          <property name="checked">
+           <bool>true</bool>
+          </property>
+         </widget>
+        </item>
+       </layout>
+      </item>
+      <item>
+       <layout class="QHBoxLayout" name="hLayoutSpatialMetric">
+        <item>
+         <widget class="QLabel" name="lblSpatialMetric">
+          <property name="text">
+           <string>Spatial Metric：</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QComboBox" name="comboSpatialMetric">
+          <item>
+           <property name="text">
+            <string>Mean Speed Error</string>
+           </property>
+          </item>
+          <item>
+           <property name="text">
+            <string>Median Speed Error</string>
+           </property>
+          </item>
+          <item>
+           <property name="text">
+            <string>Std Speed Error</string>
+           </property>
+          </item>
+          <item>
+           <property name="text">
+            <string>Mean Dir Error</string>
+           </property>
+          </item>
+          <item>
+           <property name="text">
+            <string>Median Dir Error</string>
+           </property>
+          </item>
+          <item>
+           <property name="text">
+            <string>Std Dir Error</string>
+           </property>
+          </item>
+          <item>
+           <property name="text">
+            <string>All (6 layers)</string>
+           </property>
+          </item>
+         </widget>
+        </item>
+       </layout>
+      </item>
+      <item>
+       <widget class="QPushButton" name="btnLoadResultPackage">
+        <property name="styleSheet">
+         <string notr="true">background-color: #d4edda;</string>
+        </property>
+        <property name="text">
+         <string>載入成果包</string>
+        </property>
+        <property name="toolTip">
+         <string>從選取的 manifest.json 載入驗證成果圖層</string>
+        </property>
+       </widget>
+      </item>
+     </layout>
     </widget>
    </item>
   </layout>
  </widget>
  <resources/>
- <connections>
-  <connection>
-   <sender>buttonBox</sender>
-   <signal>accepted()</signal>
-   <receiver>spinArrowSize</receiver>
-   <slot>accept()</slot>
-   <hints>
-    <hint type="sourcelabel">
-     <x>248</x>
-     <y>254</y>
-    </hint>
-    <hint type="destinationlabel">
-     <x>157</x>
-     <y>274</y>
-    </hint>
-   </hints>
-  </connection>
-  <connection>
-   <sender>buttonBox</sender>
-   <signal>rejected()</signal>
-   <receiver>spinArrowSize</receiver>
-   <slot>reject()</slot>
-   <hints>
-    <hint type="sourcelabel">
-     <x>316</x>
-     <y>260</y>
-    </hint>
-    <hint type="destinationlabel">
-     <x>286</x>
-     <y>274</y>
-    </hint>
-   </hints>
-  </connection>
- </connections>
+ <connections/>
 </ui>
