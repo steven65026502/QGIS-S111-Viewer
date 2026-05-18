@@ -17,13 +17,16 @@ import os
 _FIELD_RENAME = {
     "hindcast_date": "target_date",
     "target_time": "target_timestamp",
-    "offset_hours": "forecast_lead_hours",
+    "offset_hours": "lead_hours",
+    "forecast_lead_hours": "lead_hours",
     "error_val": "error_value",
 }
 
+_REMOVED_FIELDS = {"rmse", "dir_rmse"}
+
 # 需要嘗試轉為 float 的欄位集合（凡出現即轉，轉失敗給 None）
 _NUMERIC_FIELDS = {
-    "forecast_lead_hours",
+    "lead_hours",
     "offset_days",
     "lon",
     "lat",
@@ -49,7 +52,6 @@ _NUMERIC_FIELDS = {
     "mean_truth_speed",
     "mean_truth_direction",
     "r2",
-    "rmse",
     "bias",
     "max_err",
     "threshold",
@@ -58,7 +60,6 @@ _NUMERIC_FIELDS = {
     "std_err",
     "hotspot_warn_count",
     "hotspot_critical_count",
-    "dir_rmse",
     "dir_bias",
     "dir_max_err",
     "dir_threshold",
@@ -80,6 +81,8 @@ def _normalize_row(row: dict) -> dict:
         clean_key = key.strip().lstrip("\ufeff")
         # 欄位改名
         new_key = _FIELD_RENAME.get(clean_key, clean_key)
+        if new_key in _REMOVED_FIELDS:
+            continue
         # 數值轉型
         if new_key in _NUMERIC_FIELDS:
             try:
@@ -186,7 +189,7 @@ def load_summary_stats(manifest_or_path) -> list:
 def load_hotspots(manifest_or_path, offset_hours=None) -> list:
     """
     讀取 hotspots.csv，欄位正規化後回傳 list of dict。
-    offset_hours（整數）不為 None 時，只回傳該 forecast_lead_hours 的列。
+    offset_hours（整數）不為 None 時，只回傳該 lead_hours 的列。
     失敗或檔案不存在時回傳空 list。
     """
     manifest, package_dir = _resolve_manifest(manifest_or_path)
@@ -200,7 +203,7 @@ def load_hotspots(manifest_or_path, offset_hours=None) -> list:
     result = [_normalize_row(row) for row in raw_rows]
     if offset_hours is not None:
         target = float(offset_hours)
-        result = [r for r in result if r.get("forecast_lead_hours") == target]
+        result = [r for r in result if r.get("lead_hours") == target]
     return result
 
 

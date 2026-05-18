@@ -66,8 +66,10 @@ DIR_HOTSPOT_CRITICAL_DEG = 45.0
 # for hotspot outlines so the visual language matches the original arrows.
 HOTSPOT_WARNING_COLOR = '#FFD700'   # Yellow outline for warning hotspots
 HOTSPOT_CRITICAL_COLOR = '#FF0000'  # Red outline for critical hotspots
-DIR_HOTSPOT_WARNING_COLOR = '#4FC3F7'
-DIR_HOTSPOT_CRITICAL_COLOR = '#1565C0'
+# Direction-error hotspot outlines use distinct S-111 palette colors while
+# preserving the standard S-111 arrow symbol shape.
+DIR_HOTSPOT_WARNING_COLOR = '#F8A718'   # S-111 orange, direction warning
+DIR_HOTSPOT_CRITICAL_COLOR = '#7652E2'  # S-111 purple, direction critical
 PERCENTILE_ORANGE_COLOR = '#FF8C00'
 
 # 嘗試導入 h5py，帶詳細錯誤報告
@@ -1921,7 +1923,7 @@ class S111Viewer:
         - Forecast_24h   = 前1天檔案在同一 target_time 的預報速度
         - Forecast_48h   = 前2天檔案在同一 target_time 的預報速度
         - Forecast_72h   = 前3天檔案在同一 target_time 的預報速度
-        - 計算 RMSE / 偏差 / 最大誤差，並在 txtMetadata 顯示
+        - 計算偏差 / 最大誤差 / 平均絕對誤差，並在 txtMetadata 顯示
         - 24h 預報誤差 > 0.5 節的點繪製橙色熱點圖層
         """
         if not self.multi_reader or not self.multi_reader.current_file:
@@ -2018,15 +2020,15 @@ class S111Viewer:
             valid_mask = (t_crop > 0) & (f_crop > 0)
             if np.any(valid_mask):
                 error = np.abs(f_crop - t_crop)
-                rmse  = np.sqrt(np.mean(error[valid_mask] ** 2))
                 bias  = np.mean(f_crop[valid_mask] - t_crop[valid_mask])
                 max_e = np.max(error[valid_mask])
                 # std 保留作為描述統計，但熱點門檻改採固定值 0.5 / 1.0 kn。
                 signed_diff = f_crop[valid_mask] - t_crop[valid_mask]
                 std_e     = np.std(signed_diff)
+                mean_abs_e = np.mean(error[valid_mask])
                 threshold = HOTSPOT_WARN_KN
                 results[offset] = {
-                    'rmse': rmse, 'bias': bias, 'max_err': max_e,
+                    'bias': bias, 'max_err': max_e, 'mean_abs_err': mean_abs_e,
                     'error': error, 'valid_mask': valid_mask,
                     'rows': min_rows, 'cols': min_cols,
                     'std': std_e, 'threshold': threshold
@@ -2050,7 +2052,7 @@ class S111Viewer:
             fc_name = os.path.basename(self.uncertainty_readers[offset].filename)
             lines += [
                 f"  [{label}]  {fc_name}",
-                f"    RMSE       : {r['rmse']:.4f} 節",
+                f"    平均絕對誤差 : {r['mean_abs_err']:.4f} 節",
                 f"    偏差       : {r['bias']:+.4f} 節",
                 f"    最大誤差   : {r['max_err']:.4f} 節",
                 f"    Warning threshold : {r['threshold']:.4f} 節",
@@ -2129,256 +2131,13 @@ class S111Viewer:
 
     # ── 資料庫連線設定（與 verification_pipeline.py 相同）────────
     DB_CONFIG = {
-        'host':     'localhost',
-        'port':     5432,
-        'dbname':   's111_verification',
-        'user':     'postgres',
-        'password': '123456',
+        'host':     os.environ.get('S111_DB_HOST', 'localhost'),
+        'port':     int(os.environ.get('S111_DB_PORT', '5432')),
+        'dbname':   os.environ.get('S111_DB_NAME', 's111_verification'),
+        'user':     os.environ.get('S111_DB_USER', 'postgres'),
+        'password': os.environ.get('S111_DB_PASSWORD', ''),
     }
     H5_DIR = r'C:\Users\Rong\Desktop\test_h5_files'
-
-    def load_hotspots_from_db(self):
-        """從 PostgreSQL 讀取最新驗證結果，即時從 .h5 計算熱點並繪製"""
-        try:
-            import psycopg2
-        except ImportError:
-            QMessageBox.warning(self.dlg, '資料庫', '請先安裝 psycopg2：\npip install psycopg2-binary')
-            return
-
-        conn = None
-        try:
-            conn = psycopg2.connect(**self.DB_CONFIG)
-        except Exception as e:
-            QMessageBox.warning(self.dlg, '資料庫連線失敗', str(e))
-            return
-
-        try:
-            with conn.cursor() as cur:
-                # 確保資料表存在
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS verification_summary_stats (
-                        id            SERIAL PRIMARY KEY,
-                        target_date DATE,
-                        target_timestamp TIMESTAMP,
-                        forecast_lead_hours INTEGER,
-                        forecast_file TEXT,
-                        rmse          FLOAT,
-                        bias          FLOAT,
-                        max_error     FLOAT,
-                        threshold     FLOAT,
-                        dir_rmse      FLOAT,
-                        dir_bias      FLOAT,
-                        dir_max_error FLOAT,
-                        dir_threshold FLOAT,
-                        UNIQUE (target_date, target_timestamp, forecast_lead_hours)
-                    );
-                """)
-                cur.execute("""
-                    ALTER TABLE verification_summary_stats
-                        ADD COLUMN IF NOT EXISTS dir_rmse FLOAT,
-                        ADD COLUMN IF NOT EXISTS dir_bias FLOAT,
-                        ADD COLUMN IF NOT EXISTS dir_max_error FLOAT,
-                        ADD COLUMN IF NOT EXISTS dir_threshold FLOAT;
-                """)
-                conn.commit()
-
-                # 取最新後報日期、最後時間點，每個時距一筆
-                cur.execute("""
-                    SELECT DISTINCT ON (forecast_lead_hours)
-                        target_date, target_timestamp, forecast_lead_hours,
-                        forecast_file, rmse, bias, max_error, threshold,
-                        dir_rmse, dir_bias, dir_max_error, dir_threshold
-                    FROM verification_summary_stats
-                    ORDER BY forecast_lead_hours, target_date DESC, target_timestamp DESC
-                """)
-                rows = cur.fetchall()
-
-            conn.close()
-            conn = None
-
-            if not rows:
-                QMessageBox.information(self.dlg, '資料庫', '資料庫中尚無驗證結果')
-                return
-
-            hindcast_date = rows[0][0]
-            target_time   = rows[0][1]
-
-            # 組建文字報告
-            lines = [
-                "=" * 46,
-                "  資料庫驗證結果（最新）",
-                "=" * 46,
-                f"  後報日期   : {hindcast_date}",
-                f"  目標時間   : {target_time}",
-                "-" * 46,
-            ]
-            label_map = {24: '24h 預報', 48: '48h 預報', 72: '72h 預報'}
-            for row in rows:
-                (
-                    _, _, offset_h, fc_file, rmse, bias, max_e, threshold,
-                    dir_rmse, dir_bias, dir_max_err, dir_threshold
-                ) = row
-                lines += [
-                    f"  [{label_map.get(offset_h, f'{offset_h}h')}]  {fc_file}",
-                    f"    RMSE       : {rmse:.4f} 節",
-                    f"    偏差       : {bias:+.4f} 節",
-                    f"    最大誤差   : {max_e:.4f} 節",
-                    f"    Warning threshold : {threshold:.4f} 節",
-                    (
-                        f"    流向 RMSE    : {dir_rmse:.2f}°"
-                        if dir_rmse is not None else
-                        "    流向 RMSE    : N/A"
-                    ),
-                    (
-                        f"    流向偏差     : {dir_bias:+.2f}°"
-                        if dir_bias is not None else
-                        "    流向偏差     : N/A"
-                    ),
-                    (
-                        f"    流向最大誤差 : {dir_max_err:.2f}°"
-                        if dir_max_err is not None else
-                        "    流向最大誤差 : N/A"
-                    ),
-                    "",
-                ]
-            lines.append("=" * 46)
-            if hasattr(self.dlg, 'txtMetadata'):
-                self.dlg.txtMetadata.setText('\n'.join(lines))
-
-            # 清除舊的資料庫熱點圖層（speed / direction）
-            for key in list(self.uncertainty_hotspot_layers.keys()):
-                if isinstance(key, tuple) and len(key) == 2 and key[1] in ('speed', 'direction'):
-                    layer = self.uncertainty_hotspot_layers.pop(key, None)
-                    if layer and layer.isValid():
-                        try:
-                            QgsProject.instance().removeMapLayer(layer.id())
-                        except Exception:
-                            pass
-
-            # 即時從 .h5 計算熱點
-            hindcast_h5 = os.path.join(self.H5_DIR, str(hindcast_date).replace('-', '') + '.h5')
-            if not os.path.exists(hindcast_h5):
-                QMessageBox.warning(self.dlg, '找不到後報檔案', f'請確認檔案存在:\n{hindcast_h5}')
-                return
-
-            truth_speed, truth_dir, truth_gt = self._read_h5_at_time(hindcast_h5, target_time)
-            if truth_speed is None:
-                QMessageBox.warning(self.dlg, '讀取失敗', '無法讀取後報 .h5 檔案')
-                return
-
-            offset_map = {24: 1, 48: 2, 72: 3}
-            for row in rows:
-                (
-                    _, _, offset_h, fc_file, _, _, _, threshold,
-                    dir_rmse, dir_bias, dir_max_err, dir_threshold
-                ) = row
-                fc_path = os.path.join(self.H5_DIR, fc_file)
-                if not os.path.exists(fc_path):
-                    print(f"[資料庫] 找不到預報檔案: {fc_path}")
-                    continue
-
-                fc_speed, fc_dir, _ = self._read_h5_at_time(fc_path, target_time)
-                if fc_speed is None:
-                    continue
-
-                min_rows = min(truth_speed.shape[0], fc_speed.shape[0])
-                min_cols = min(truth_speed.shape[1], fc_speed.shape[1])
-                t_crop = truth_speed[:min_rows, :min_cols]
-                f_crop = fc_speed[:min_rows,   :min_cols]
-
-                valid_mask = (t_crop > 0) & (f_crop > 0)
-                error = np.abs(f_crop - t_crop)
-                above = (error > threshold) & valid_mask
-
-                if np.any(above) and truth_gt:
-                    gt = truth_gt
-                    r_idx, c_idx = np.where(above)
-                    lons = gt[0] + c_idx * gt[1]
-                    lats = gt[3] + r_idx * gt[5]
-                    errs = error[r_idx, c_idx]
-                    self._draw_db_hotspot_layer(
-                        offset_map.get(offset_h, 1), lons, lats, errs,
-                        error_type='speed'
-                    )
-                    print(f"[資料庫] {offset_h}h 繪製 {len(lons)} 個熱點")
-
-        except Exception as e:
-            QMessageBox.warning(self.dlg, '資料庫讀取失敗', str(e))
-            if conn:
-                conn.close()
-
-    def _read_h5_at_time(self, h5_path, target_time):
-        """從 .h5 讀取最接近 target_time 的速度/流向資料。"""
-        import datetime as _dt
-        THRESHOLD_SECONDS = 1800
-        try:
-            with h5py.File(h5_path, 'r') as f:
-                try:
-                    meta = {k: (v.decode('utf-8') if isinstance(v, bytes) else v) for k, v in f.attrs.items()}
-                    gt = [
-                        float(meta.get('westBoundLongitude', 0)),
-                        float(meta.get('gridSpacingLongitudinal', 0.01)),
-                        0,
-                        float(meta.get('northBoundLatitude', 0)),
-                        0,
-                        -float(meta.get('gridSpacingLatitudinal', 0.01)),
-                    ]
-                except Exception:
-                    gt = None
-
-                sc = f.get('SurfaceCurrent', f.get('SurfaceCurrent.01', None))
-                if sc is None:
-                    return None, None, None
-                sc01 = sc.get('SurfaceCurrent.01', sc)
-                groups = sorted(
-                    [g for g in sc01 if g.startswith('Group_')],
-                    key=lambda x: int(x.split('_')[1])
-                )
-                for gn in groups:
-                    grp = sc01[gn]
-                    tp = None
-                    for tf in ['timePoint', 'timepoint', 'time', 'Time']:
-                        raw = grp.attrs.get(tf) or (grp[tf][()] if tf in grp else None)
-                        if raw is not None:
-                            if isinstance(raw, bytes):
-                                raw = raw.decode('utf-8')
-                            try:
-                                tp = _dt.datetime.fromisoformat(raw.rstrip('Z'))
-                            except Exception:
-                                pass
-                            break
-                    if tp is None:
-                        continue
-                    if abs((tp - target_time).total_seconds()) > THRESHOLD_SECONDS:
-                        continue
-                    speed = None
-                    direction = None
-                    if 'values' in grp:
-                        vals = grp['values'][()]
-                        if hasattr(vals.dtype, 'names') and vals.dtype.names:
-                            if 'surfaceCurrentSpeed' in vals.dtype.names:
-                                speed = vals['surfaceCurrentSpeed']
-                            if 'surfaceCurrentDirection' in vals.dtype.names:
-                                direction = vals['surfaceCurrentDirection']
-                    if speed is None:
-                        for sf in ['surfaceCurrentSpeed', 'speed', 'Speed']:
-                            if sf in grp:
-                                speed = grp[sf][()]
-                                break
-                    if direction is None:
-                        for df in ['surfaceCurrentDirection', 'direction', 'Direction']:
-                            if df in grp:
-                                direction = grp[df][()]
-                                break
-                    if speed is None:
-                        continue
-                    speed = np.flipud(speed)
-                    if direction is not None:
-                        direction = np.flipud(direction)
-                    return speed, direction, gt
-        except Exception as e:
-            print(f"[讀取] {h5_path}: {e}")
-        return None, None, None
 
     def _draw_db_hotspot_layer(self, offset, lons, lats, errors, error_type='speed'):
         """從資料庫座標直接繪製熱點圖層"""
@@ -5554,12 +5313,40 @@ class S111Viewer:
         try:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT DISTINCT ON (forecast_lead_hours)
-                        target_date, target_timestamp, forecast_lead_hours,
-                        forecast_file, rmse, bias, max_error, threshold,
-                        dir_rmse, dir_bias, dir_max_error, dir_threshold
-                    FROM verification_summary_stats
-                    ORDER BY forecast_lead_hours, target_date DESC, target_timestamp DESC
+                    WITH latest_date AS (
+                        SELECT max(target_date) AS target_date
+                        FROM summary_stats
+                    )
+                    SELECT
+                        s.target_date,
+                        max(s.forecast_issue_date) AS forecast_issue_date,
+                        s.lead_hours,
+                        avg(s.bias) FILTER (WHERE s.bias IS NOT NULL) AS bias,
+                        max(s.max_error) AS max_error,
+                        avg(s.mean_abs_error) FILTER (WHERE s.mean_abs_error IS NOT NULL) AS mean_abs_error,
+                        percentile_cont(0.5) WITHIN GROUP (ORDER BY s.median_error)
+                            FILTER (WHERE s.median_error IS NOT NULL) AS median_error,
+                        stddev_pop(s.mean_abs_error)
+                            FILTER (WHERE s.mean_abs_error IS NOT NULL) AS std_error,
+                        sum(coalesce(s.hotspot_warn_count, 0))::integer AS hotspot_warn_count,
+                        sum(coalesce(s.hotspot_critical_count, 0))::integer AS hotspot_critical_count,
+                        avg(s.dir_bias) FILTER (WHERE s.dir_bias IS NOT NULL) AS dir_bias,
+                        max(s.dir_max_error) AS dir_max_error,
+                        avg(s.dir_mean_abs_error)
+                            FILTER (WHERE s.dir_mean_abs_error IS NOT NULL) AS dir_mean_abs_error,
+                        percentile_cont(0.5) WITHIN GROUP (ORDER BY s.dir_median_error)
+                            FILTER (WHERE s.dir_median_error IS NOT NULL) AS dir_median_error,
+                        stddev_pop(s.dir_mean_abs_error)
+                            FILTER (WHERE s.dir_mean_abs_error IS NOT NULL) AS dir_std_error,
+                        sum(coalesce(s.dir_hotspot_warn_count, 0))::integer AS dir_hotspot_warn_count,
+                        sum(coalesce(s.dir_hotspot_critical_count, 0))::integer AS dir_hotspot_critical_count,
+                        count(DISTINCT s.target_timestamp)::integer AS time_count,
+                        min(s.target_timestamp) AS first_timestamp,
+                        max(s.target_timestamp) AS last_timestamp
+                    FROM summary_stats s
+                    JOIN latest_date ld ON s.target_date = ld.target_date
+                    GROUP BY s.target_date, s.lead_hours
+                    ORDER BY s.lead_hours
                 """)
                 rows = cur.fetchall()
 
@@ -5567,47 +5354,63 @@ class S111Viewer:
                     QMessageBox.information(self.dlg, '資料庫', '資料庫中尚無驗證結果')
                     return
 
+                def _fmt(value, digits=4, suffix=""):
+                    if value is None:
+                        return "N/A"
+                    try:
+                        return f"{float(value):.{digits}f}{suffix}"
+                    except (TypeError, ValueError):
+                        return "N/A"
+
+                def _fmt_signed(value, digits=4, suffix=""):
+                    if value is None:
+                        return "N/A"
+                    try:
+                        return f"{float(value):+.{digits}f}{suffix}"
+                    except (TypeError, ValueError):
+                        return "N/A"
+
+                def _fmt_dt(value):
+                    if value is None:
+                        return "N/A"
+                    if hasattr(value, "strftime"):
+                        return value.strftime("%Y-%m-%d %H:%M")
+                    return str(value)
+
+                first_timestamp = rows[0][-2]
+                last_timestamp = rows[0][-1]
+                time_count = max(row[-3] or 0 for row in rows)
                 lines = [
                     "=" * 46,
-                    "  資料庫驗證結果（最新）",
+                    "  資料庫驗證結果（最新全天）",
                     "=" * 46,
                     f"  後報日期   : {rows[0][0]}",
-                    f"  目標時間   : {rows[0][1]}",
+                    f"  統計方式   : 全天彙整",
+                    f"  時間範圍   : {_fmt_dt(first_timestamp)} - {_fmt_dt(last_timestamp)}",
+                    f"  時間點數   : {time_count}",
                     "-" * 46,
                 ]
                 label_map = {24: '24h 預報', 48: '48h 預報', 72: '72h 預報'}
                 for row in rows:
                     (
-                        _target_date, _target_timestamp, offset_h, fc_file,
-                        rmse, bias, max_e, threshold,
-                        dir_rmse, dir_bias, dir_max_err, dir_threshold
+                        _target_date, _forecast_issue_date, offset_h,
+                        bias, max_e, mean_abs_error, median_error, std_error,
+                        hotspot_warn_count, hotspot_critical_count,
+                        dir_bias, dir_max_err,
+                        dir_mean_abs_error, dir_median_error, dir_std_error,
+                        dir_hotspot_warn_count, dir_hotspot_critical_count,
+                        _time_count, _first_timestamp, _last_timestamp
                     ) = row
                     lines += [
-                        f"  [{label_map.get(offset_h, f'{offset_h}h')}]  {fc_file}",
-                        f"    RMSE       : {rmse:.4f} 節",
-                        f"    偏差       : {bias:+.4f} 節",
-                        f"    最大誤差   : {max_e:.4f} 節",
-                        f"    Warning threshold : {threshold:.4f} 節",
-                        (
-                            f"    流向 RMSE    : {dir_rmse:.2f}°"
-                            if dir_rmse is not None else
-                            "    流向 RMSE    : N/A"
-                        ),
-                        (
-                            f"    流向偏差     : {dir_bias:+.2f}°"
-                            if dir_bias is not None else
-                            "    流向偏差     : N/A"
-                        ),
-                        (
-                            f"    流向最大誤差 : {dir_max_err:.2f}°"
-                            if dir_max_err is not None else
-                            "    流向最大誤差 : N/A"
-                        ),
-                        (
-                            f"    流向 hotspot threshold : {float(dir_threshold):.2f}°"
-                            if dir_threshold is not None else
-                            "    流向 hotspot threshold : N/A"
-                        ),
+                        f"  [{label_map.get(offset_h, f'{offset_h}h')}] 發布日: {_forecast_issue_date or 'N/A'}",
+                        f"    流速偏差        : {_fmt_signed(bias)} 節",
+                        f"    流速最大誤差    : {_fmt(max_e)} 節",
+                        f"    流速平均/中位/STD: {_fmt(mean_abs_error)} / {_fmt(median_error)} / {_fmt(std_error)} 節",
+                        f"    流速 hotspot    : warning {hotspot_warn_count or 0} / critical {hotspot_critical_count or 0}",
+                        f"    流向偏差        : {_fmt_signed(dir_bias, 2, '°')}",
+                        f"    流向最大誤差    : {_fmt(dir_max_err, 2, '°')}",
+                        f"    流向平均/中位/STD: {_fmt(dir_mean_abs_error, 2)} / {_fmt(dir_median_error, 2)} / {_fmt(dir_std_error, 2)} °",
+                        f"    流向 hotspot    : warning {dir_hotspot_warn_count or 0} / critical {dir_hotspot_critical_count or 0}",
                         "",
                     ]
                 lines.append("=" * 46)
@@ -5625,16 +5428,16 @@ class S111Viewer:
 
                 offset_map = {24: 1, 48: 2, 72: 3}
                 for row in rows:
-                    target_date, target_timestamp, offset_h, _fc_file, *_rest = row
+                    target_date, _forecast_issue_date, offset_h, *_rest = row
                     for error_type in ('speed', 'direction'):
                         cur.execute("""
                             SELECT lon, lat, error_value
-                            FROM verification_hotspot_points
+                            FROM hotspot_points
                             WHERE target_date = %s
-                              AND target_timestamp = %s
-                              AND forecast_lead_hours = %s
+                              AND lead_hours = %s
                               AND error_type = %s
-                        """, (target_date, target_timestamp, offset_h, error_type))
+                              AND metric IS NULL
+                        """, (target_date, offset_h, error_type))
                         hotspot_rows = cur.fetchall()
                         if not hotspot_rows:
                             continue
@@ -5740,6 +5543,7 @@ class S111Viewer:
                     QgsField("error_value", QVariant.Double),
                     QgsField("severity", QVariant.String),
                     QgsField("error_type", QVariant.String),
+                    QgsField("metric", QVariant.String),
                     QgsField("speed", QVariant.Double),
                     QgsField("direction", QVariant.Double),
                 ])
@@ -5766,6 +5570,7 @@ class S111Viewer:
                         _float_or_none(row.get("error_value")),
                         severity_key,
                         error_type,
+                        str(row.get("metric", "")),
                         _float_or_none(row.get("speed")) or 0.0,
                         _float_or_none(row.get("direction")) or 0.0,
                     ])
@@ -5995,10 +5800,23 @@ class S111Viewer:
         files_section = manifest.get("files", {}) if isinstance(manifest, dict) else {}
         metric_geojson = files_section.get("hotspot_metric_geojson", {})
         offset_files = metric_geojson.get(str(offset_hours), {}) if isinstance(metric_geojson, dict) else {}
-        if not isinstance(offset_files, dict) or not offset_files:
+        if not offset_files:
             return 0
 
         package_dir = os.path.dirname(os.path.abspath(manifest_path))
+        if isinstance(offset_files, str):
+            geojson_path = os.path.join(package_dir, offset_files)
+            if not os.path.isfile(geojson_path):
+                print(f"[成果包] 找不到 metric hotspot GeoJSON：{geojson_path}")
+                return 0
+            return self._create_result_package_hotspot_sidecar_layer_from_geojson(
+                geojson_path,
+                f"{date_str} {offset_hours}h Metric",
+            )
+
+        if not isinstance(offset_files, dict):
+            return 0
+
         metric_order = ["mean", "median", "std", "mean_dir", "median_dir", "std_dir"]
         metric_labels = {
             "mean": "Mean Speed",
@@ -6611,7 +6429,7 @@ class S111Viewer:
             viewer.test_s102_loading()  # 會彈出檔案選擇對話框
 
             # 或直接指定路徑:
-            viewer.test_s102_loading(r'C:\path\to\your\s102_file.h5')
+            viewer.test_s102_loading('C:/path/to/your/s102_file.h5')
         """
         print("\n" + "="*60)
         print("S-102 載入測試")

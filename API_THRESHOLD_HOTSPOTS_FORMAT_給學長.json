@@ -1,0 +1,175 @@
+{
+  "name": "S-111 threshold hotspot drawing API",
+  "description": "依照指定 threshold 從資料庫 hotspot_points 取出超標點，回傳可直接在 QGIS 或網頁地圖顯示的點資料。",
+  "endpoint": "/api/threshold-hotspots",
+  "method": "GET",
+  "example_url": "/api/threshold-hotspots?date=2026-04-10&lead_hours=24&error_type=speed&threshold=0.6&limit=1000",
+  "std_dir_example_url": "/api/threshold-hotspots?date=2026-04-10&lead_hours=24&error_type=direction&metric=std_dir&threshold=30&limit=1000",
+  "click_detail_endpoint": {
+    "endpoint": "/api/hotspot-series",
+    "method": "GET",
+    "example_by_id": "/api/hotspot-series?id=119051239",
+    "example_by_lon_lat": "/api/hotspot-series?lon=120.295&lat=26.345&date=2026-04-10&lead_hours=24&error_type=speed&radius_deg=0.02",
+    "description": "地圖先顯示 threshold-hotspots 的點；使用者點選後，用該點 id 或經緯度查同一個 hotspot 點的時間資料。"
+  },
+  "request_parameters": {
+    "date": {
+      "type": "string",
+      "required": false,
+      "description": "目標日期，格式 YYYY-MM-DD 或 YYYYMMDD；不填則取資料庫最新日期。"
+    },
+    "lead_hours": {
+      "type": "integer",
+      "required": false,
+      "description": "預報時距，例如 24、48、72。"
+    },
+    "error_type": {
+      "type": "string",
+      "required": true,
+      "allowed_values": ["speed", "direction"],
+      "description": "誤差類型。使用 threshold 時必須指定。"
+    },
+    "metric": {
+      "type": "string",
+      "required": false,
+      "default": "official",
+      "allowed_values": ["official", "mean", "median", "std", "mean_dir", "median_dir", "std_dir"],
+      "description": "不填或 official 代表官方 hotspot；std_dir 代表流向誤差標準差，也就是穩定度/離散度指標。"
+    },
+    "threshold": {
+      "type": "number",
+      "required": true,
+      "description": "只回傳 value >= threshold 的點。speed 單位為 kn，direction 單位為 deg。"
+    },
+    "critical_threshold": {
+      "type": "number",
+      "required": false,
+      "description": "critical 顏色門檻。不填時 speed 預設 1.0 kn，direction 預設 45 deg。"
+    },
+    "bbox": {
+      "type": "string",
+      "required": false,
+      "description": "空間範圍，格式 min_lon,min_lat,max_lon,max_lat。"
+    },
+    "limit": {
+      "type": "integer",
+      "required": false,
+      "default": 5000,
+      "description": "最多回傳幾筆點資料。"
+    },
+    "offset": {
+      "type": "integer",
+      "required": false,
+      "default": 0,
+      "description": "分頁起點。"
+    },
+    "format": {
+      "type": "string",
+      "required": false,
+      "allowed_values": ["json", "geojson"],
+      "default": "json",
+      "description": "回傳格式。"
+    }
+  },
+  "response_shape": {
+    "ok": true,
+    "count": 2,
+    "limit": 1000,
+    "offset": 0,
+    "filters": {
+      "date": "2026-04-10",
+      "lead_hours": 24,
+      "error_type": "speed",
+      "metric": "official",
+      "threshold": 0.6,
+      "critical_threshold": null
+    },
+    "qgis_drawing": {
+      "geometry": "Point",
+      "crs": "EPSG:4326",
+      "x_field": "lon",
+      "y_field": "lat",
+      "value_field": "value",
+      "color_field": "color"
+    },
+    "rows": [
+      {
+        "id": 119053905,
+        "target_date": "2026-04-10",
+        "target_timestamp": "2026-04-10T00:00:00",
+        "lead_hours": 24,
+        "lon": 119.5,
+        "lat": 22.5,
+        "value": 0.6207,
+        "unit": "kn",
+        "error_type": "speed",
+        "severity": "warning",
+        "color": "#FFD700",
+        "qgis_symbol": {
+          "geometry": "Point",
+          "crs": "EPSG:4326",
+          "color": "#FFD700",
+          "outline_color": "#FFD700",
+          "size_mm": 3.5
+        }
+      }
+    ]
+  },
+  "std_dir_row_example": {
+    "id": 121117003,
+    "target_date": "2026-04-10",
+    "lead_hours": 24,
+    "lon": 121.065,
+    "lat": 26.995,
+    "value": 58.7962646484375,
+    "unit": "deg",
+    "error_type": "direction",
+    "metric": "std_abs_dir_error",
+    "severity": "critical",
+    "color": "#7652E2"
+  },
+  "color_rules": [
+    {
+      "error_type": "speed",
+      "severity": "warning",
+      "condition": "threshold <= value < critical_threshold",
+      "default_threshold": 0.5,
+      "default_critical_threshold": 1.0,
+      "unit": "kn",
+      "color": "#FFD700"
+    },
+    {
+      "error_type": "speed",
+      "severity": "critical",
+      "condition": "value >= critical_threshold",
+      "default_critical_threshold": 1.0,
+      "unit": "kn",
+      "color": "#FF0000"
+    },
+    {
+      "error_type": "direction",
+      "severity": "warning",
+      "condition": "threshold <= value < critical_threshold",
+      "default_threshold": 30.0,
+      "default_critical_threshold": 45.0,
+      "unit": "deg",
+      "color": "#F8A718"
+    },
+    {
+      "error_type": "direction",
+      "severity": "critical",
+      "condition": "value >= critical_threshold",
+      "default_critical_threshold": 45.0,
+      "unit": "deg",
+      "color": "#7652E2"
+    }
+  ],
+  "notes": [
+    "rows 會是多筆點資料，不是只有一個點。",
+    "目前資料來源是 hotspot_points，因此適合回傳 hotspot/超標點。",
+    "metric=std_dir 已可用來回傳流向誤差標準差超過門檻的點。",
+    "使用者點選地圖上的點後，可用 /api/hotspot-series 查該點的 hotspot 時間資料。",
+    "hotspot-series 目前只會回傳該點有出現在 hotspot_points 的時段，不代表完整 24 小時所有格點值。",
+    "如果未來要回傳全部範圍的所有格點，需要另外建立完整格點資料表。"
+  ]
+}

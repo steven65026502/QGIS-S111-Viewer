@@ -1,0 +1,16 @@
+[Unit]
+Description=S-111 Verification Flask API
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=s111api
+Group=www-data
+WorkingDirectory=/opt/s111_viewer
+EnvironmentFile=/etc/s111/s111-api.env
+ExecStart=/opt/s111_viewer/.venv/bin/gunicorn --workers 2 --timeout 120 --bind 127.0.0.1:8111 'scripts.s111_api_server:create_app()'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
