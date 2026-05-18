@@ -4995,9 +4995,15 @@ class S111Viewer:
 
             elif basename.endswith("_hotspots.geojson"):
                 if load_hs:
+                    selected_metric_key = (
+                        self._selected_result_package_metric_key()
+                        if ".metric_hotspots." in basename
+                        else None
+                    )
                     created = self._create_result_package_hotspot_sidecar_layer_from_geojson(
                         source_path,
                         date_str,
+                        metric_key=selected_metric_key,
                     )
                     if created > 0:
                         loaded_any = True
@@ -5629,6 +5635,23 @@ class S111Viewer:
             return metric_defs
         return [metric_def for metric_def in metric_defs if metric_def[0] == selected_key]
 
+    def _selected_result_package_metric_key(self):
+        metric_defs = self._selected_result_package_spatial_metric_defs()
+        if len(metric_defs) == 1:
+            return metric_defs[0][0]
+        return None
+
+    def _result_package_metric_label(self, metric_key):
+        labels = {
+            "mean_abs_error": "Mean Speed",
+            "median_abs_error": "Median Speed",
+            "std_abs_error": "Std Speed",
+            "mean_abs_dir_error": "Mean Direction",
+            "median_abs_dir_error": "Median Direction",
+            "std_abs_dir_error": "Std Direction",
+        }
+        return labels.get(metric_key, metric_key)
+
     def _result_package_spatial_auxiliary_style_path(self, geojson_path, suffix):
         stem, _ = os.path.splitext(os.path.basename(geojson_path))
         short_stem = stem.replace("_spatial_stats_", "_")
@@ -5804,6 +5827,8 @@ class S111Viewer:
             return 0
 
         package_dir = os.path.dirname(os.path.abspath(manifest_path))
+        selected_metric_key = self._selected_result_package_metric_key()
+        suffix_map = self._result_package_spatial_sidecar_suffix_map()
         if isinstance(offset_files, str):
             geojson_path = os.path.join(package_dir, offset_files)
             if not os.path.isfile(geojson_path):
@@ -5812,12 +5837,17 @@ class S111Viewer:
             return self._create_result_package_hotspot_sidecar_layer_from_geojson(
                 geojson_path,
                 f"{date_str} {offset_hours}h Metric",
+                metric_key=selected_metric_key,
             )
 
         if not isinstance(offset_files, dict):
             return 0
 
-        metric_order = ["mean", "median", "std", "mean_dir", "median_dir", "std_dir"]
+        if selected_metric_key is None:
+            metric_order = ["mean", "median", "std", "mean_dir", "median_dir", "std_dir"]
+        else:
+            selected_suffix = suffix_map.get(selected_metric_key)
+            metric_order = [selected_suffix] if selected_suffix else []
         metric_labels = {
             "mean": "Mean Speed",
             "median": "Median Speed",
@@ -5868,13 +5898,24 @@ class S111Viewer:
             rows.append(row)
         return rows
 
-    def _create_result_package_hotspot_sidecar_layer_from_geojson(self, geojson_path, date_str):
+    def _create_result_package_hotspot_sidecar_layer_from_geojson(self, geojson_path, date_str, metric_key=None):
         """直接從 hotspots GeoJSON 建立 speed/direction 熱點圖層。"""
         layer_key = f"{date_str}_hotspots_geojson_{os.path.basename(geojson_path)}"
         rows = self._load_result_package_hotspot_rows_from_geojson(geojson_path)
         if not rows:
             print(f"[成果包] Hotspot GeoJSON 圖層無效：{geojson_path}")
             return 0
+        has_metric_rows = any(str(row.get("metric", "")).strip() for row in rows)
+        if metric_key and has_metric_rows:
+            rows = [
+                row for row in rows
+                if str(row.get("metric", "")).strip() == metric_key
+            ]
+            if not rows:
+                print(f"[成果包] Metric Hotspot 無符合 {metric_key} 的資料：{geojson_path}")
+                return 0
+            layer_key = f"{layer_key}_{metric_key}"
+            date_str = f"{date_str} {self._result_package_metric_label(metric_key)}"
         created = self._create_result_package_hotspot_layer(
             rows,
             layer_name=f"{date_str} Hotspots",

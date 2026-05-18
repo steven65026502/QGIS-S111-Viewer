@@ -21,6 +21,10 @@
 - Added API usage, deployment, handoff, threshold-hotspot format, layer-splitting, validation, and data-version notes.
 - Added `API_UPDATE_LOG_20260518_DIRECTION_COLOR.md` to explicitly describe the 2026-05-18 color update, its scope, and what was not recalculated.
 
+### Fixed
+
+- Fixed direct loading of `*.metric_hotspots.geojson` in QGIS result-package mode. The `Spatial Metric` selector now filters the GeoJSON `metric` field, so selecting `Median Dir Error` loads only `median_abs_dir_error` hotspot rows instead of mixing mean, median, and std rows.
+
 ### Validation
 
 - Verified the deployed API returned the updated direction hotspot colors.
